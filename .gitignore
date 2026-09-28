@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+.venv/
+venv/
+
+# Weights, data and run outputs never belong in the repository
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.tar
+*.tar.gz*
+/ckpt/
+/datasets/
+/output/
+/outputs/
+/render/
+wandb/
+*.log
+nohup.out
+
+# Media
+*.mp4
+*.gif
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+.nfs*

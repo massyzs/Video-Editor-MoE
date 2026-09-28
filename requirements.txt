@@ -1,0 +1,25 @@
+# Tested with Python 3.10, CUDA 12.8 and the versions pinned below.
+torch==2.8.0
+torchvision==0.23.0
+diffusers @ git+https://github.com/huggingface/diffusers.git@a487e2f131b320f51dd5331e0c2fe95f4744d0c5
+transformers==5.12.1
+accelerate==1.14.0
+deepspeed==0.19.6          # mlp-moe / videoeditor-14b / videoeditor-56b training (ZeRO-3)
+peft==0.19.1               # explicit-moe (LoRA experts)
+safetensors==0.8.0
+einops==0.8.2
+omegaconf==2.3.1
+numpy==2.2.5
+pillow==12.2.0
+opencv-python==4.13.0.92
+decord==0.6.0
+imageio[ffmpeg]==2.37.3
+func_timeout==4.3.5
+tqdm
+scipy
+librosa
+huggingface_hub
+wandb                      # optional: training logs
+# Optional, faster attention:
+#   flash-attn==2.8.3.post1   (pip install flash-attn --no-build-isolation)
+#   FlashAttention-3 (flash_attn_interface) for Hopper GPUs

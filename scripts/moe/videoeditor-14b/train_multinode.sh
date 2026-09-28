@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# =============================================================================
+# moe_v3_1 (videoeditor-14b) multi-node launcher (DeepSpeed ZeRO-3), default 3 nodes x 8 GPUs = 24 GPUs. Run one copy on every node:
+#     bash scripts/moe/videoeditor-14b/train_multinode.sh <NODE_RANK>      # NODE_RANK = 0 .. NUM_NODES-1, node 0 = MASTER_ADDR
+# Model: see the header of wan_transformer3d_kiwi_moe_v3_1.py. In the 14 even-numbered layers both self-attention k/v and FFN are 7-expert top-3 MoEs (0 = original / 1..5 = category experts / 6 = GOKU direct fine-tune), no shared FFN;
+# in self-attention each token contributes 3 expert (k,v) pairs concatenated into the sequence (no shared copy), with log ĝ as a prior. Training logic: see the header of moe_v3_1_train.py.
+# Data: mixed = all of original OpenVE (minus subtitles_edit) x1 + GOKU / CoinVE x MULTI_REPEAT each, shuffled together, 1 epoch. No masks. Full training, three lr groups, batch 8/GPU, accum 1.
+# Requires: <BASE_DIR>/ckpt/kiwi-edit-instruct-only-videoxfun/ (base model) and EXPERTS_MERGED (expert init weights produced by merge_experts_v3_1.py, not part of the released weights).
+# resume: put RESUME_DS_STATE=<ckpt/ds_state_step-N dir> in $OUT/stage.env (one file read by all nodes, so OUT must be on shared storage).
+# wandb: logs to wandb if WANDB_API_KEY is set in the environment, otherwise tensorboard only.
+# =============================================================================
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: bash $0 <NODE_RANK>   (0 .. NUM_NODES-1; run once on every node)"
+  exit 1
+fi
+
+# ---------------------------- Config (edit for your environment) ----------------------------
+BASE_DIR=/path/to/workdir          # contains ckpt/kiwi-edit-instruct-only-videoxfun/, datasets/, output/
+DATASET_BASE=/path/to/video/root   # prefix for the relative video paths inside the dataset json files
+MASTER_ADDR=127.0.0.1              # IP of node 0
+MASTER_PORT=29841
+NUM_NODES=3
+GPUS_PER_NODE=8
+NODE_RANK=$1                       # pass 0..NUM_NODES-1 as the first argument on each node
+USE_EFA=0                          # 1 = set AWS EFA network environment variables (see below)
+FA3_SITE=                          # optional: directory of a separately installed FlashAttention-3 (flash_attn_interface); empty = none
+MOE_ATTN_BACKEND=fa3               # attention backend fa2 / fa3 / cudnn / auto; falls back to fa2 if fa3 cannot be imported
+
+EXPERIMENT=videoeditor-14b
+REPO_ROOT=$(cd "$(dirname "$(realpath "$0")")/../../.." && pwd)
+cd "$REPO_ROOT"
+
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+NUM_PROCESSES=$((NUM_NODES * GPUS_PER_NODE))
+
+OUT=${BASE_DIR}/output/${EXPERIMENT}
+LOG_DIR=${OUT}/logs
+mkdir -p "$LOG_DIR" "$OUT/ckpt" "$OUT/render"     # convention: ckpt/ holds weights, render/ holds inference results
+LOG_FILE=${LOG_DIR}/node${NODE_RANK}_$(date +%Y%m%d_%H%M%S).log
+touch "$LOG_FILE"
+ln -sf "$(basename "$LOG_FILE")" "${LOG_DIR}/node${NODE_RANK}_latest.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "[log] $(date '+%F %T')  node=${NODE_RANK}/${NUM_NODES}  ->  $LOG_FILE"
+
+# Prepend a directory to an environment variable (works whether or not it is already set)
+prepend_path() {
+  local cur
+  cur=$(printenv "$1" || true)
+  if [ -n "$cur" ]; then export "$1=$2:$cur"; else export "$1=$2"; fi
+}
+
+# ---- Network / NCCL
+export NCCL_DEBUG=INFO
+if [ "$USE_EFA" = 1 ]; then          # AWS EFA (p4d/p5-class instances); change the NIC name eth0 to match your setup
+  prepend_path LD_LIBRARY_PATH /opt/amazon/efa/lib
+  prepend_path LD_LIBRARY_PATH /opt/amazon/ofi-nccl/lib/x86_64-linux-gnu
+  export FI_PROVIDER=efa
+  export FI_EFA_USE_DEVICE_RDMA=1
+  export NCCL_ALGO=NVLS,TREE,RING
+  export NCCL_PROTO=SIMPLE,LL,LL128
+  export NCCL_BUFFSIZE=8388608
+  export NCCL_SOCKET_IFNAME=eth0
+  export GLOO_SOCKET_IFNAME=eth0
+  export UCX_NET_DEVICES=eth0
+  export NCCL_IB_DISABLE=0
+  export NCCL_P2P_DISABLE=0
+  export NCCL_IB_GID_INDEX=3
+  export NCCL_IB_SL=3
+  export NCCL_IB_TC=160
+  export NCCL_IB_QPS_PER_CONNECTION=4
+  export NCCL_IB_CUDA_SUPPORT=1
+  export NCCL_CHECK_DISABLE=1
+  export NCCL_LL_THRESHOLD=16384
+  export NCCL_COLLNET_ENABLE=0
+  export SHARP_COLL_ENABLE_SAT=0
+  export NCCL_NET_GDR_LEVEL=2
+  export NCCL_PXN_DISABLE=0
+fi
+
+# ---- Attention backend: FA3 optional
+if [ -n "$FA3_SITE" ]; then prepend_path PYTHONPATH "$FA3_SITE"; fi
+if [ "$MOE_ATTN_BACKEND" = fa3 ] && ! python -c "import flash_attn_interface" >/dev/null 2>&1; then
+  echo "[moe-v3.1] flash_attn_interface (FA3) not importable, falling back to MOE_ATTN_BACKEND=fa2"
+  MOE_ATTN_BACKEND=fa2
+fi
+export MOE_ATTN_BACKEND
+
+export VIDEO_READER_TIMEOUT=120
+export PYTHONWARNINGS="ignore::Warning"
+# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # disabled: VMM memory + EFA GDR suspected of corrupting ZeRO-3 all-gather data on some ranks
+export MALLOC_ARENA_MAX=4
+export MALLOC_TRIM_THRESHOLD_=134217728
+
+# ---- wandb: the key is read from the environment only
+if printenv WANDB_API_KEY >/dev/null; then USE_WANDB=1; else USE_WANDB=0; fi
+WANDB_PROJECT=video-editor-moe
+WANDB_RUN=${EXPERIMENT}
+
+CKPT=${BASE_DIR}/ckpt/kiwi-edit-instruct-only-videoxfun
+WAN_PATH=${CKPT}
+WAN_CONFIG=config/wan2.2/wan_civitai_5b.yaml
+MLLM_MODEL=${CKPT}/qwen
+INIT_WEIGHTS=${CKPT}/moe_expert_init.safetensors
+EXPERTS_MERGED=${BASE_DIR}/ckpt/init/experts_v3_1.safetensors      # output of merge_experts_v3_1.py (experts 1..6; expert 0 is copied from the base model at build time)
+
+STAGE_A_DATA=${BASE_DIR}/datasets/filtered/openve_original_nosub_all.json   # all 1,788,804 pairs of original OpenVE-3M (only the whole subtitles_edit category removed)
+STAGE_B_DATA=${BASE_DIR}/datasets/classified/goku_with_masks.jsonl,${BASE_DIR}/datasets/classified/CoinVE.jsonl
+STAGE_A_EPOCHS=1
+STAGE_B_EPOCHS=2                     # only used by two_stage
+DATA_SCHEDULE=mixed                  # OpenVE x1 + GOKU/CoinVE x MULTI_REPEAT each, shuffled together for STAGE_A_EPOCHS epochs; two_stage = A then B
+MULTI_REPEAT=8                       # multi-edit matches OpenVE in size (223,525x8 ~ 1,788,200 vs 1,788,788), ~18,630 steps total; the first 1000 steps (before a resume) used x2
+EXCLUDE_PROMPT_WORDS=overlay,subtitle   # in original OpenVE the "overlay" category is named subtitles_edit and its instructions say "subtitles"; word filter as a fallback
+
+MOE_LAYERS=1,3,5,7,9,11,13,15,17,19,21,23,25,27   # 0-based block indices = layers 2,4,...,28
+MOE_NUM_EXPERTS=7                    # 0 = original / 1..5 = category experts / 6 = GOKU direct fine-tune
+MOE_TOP_K=3                          # top-3 for both self-attention k/v and FFN
+MOE_AUX_LOSS_ALPHA=0.0001
+
+BATCH_SIZE=8                         # per GPU; effective batch = 24 x 8 = 192
+LEARNING_RATE=1e-5                   # base lr for full training; original parameters always use it
+NEW_LAYERS_LR=1e-4                   # initial lr of new layers (routed experts + gates), decays linearly to LEARNING_RATE over the first NEW_LAYERS_LR_STEPS steps
+NEW_LAYERS_LR_STEPS=2000
+GATE_LR=1e-3                         # initial gate lr, linear to GATE_LR_END over the first NEW_LAYERS_LR_STEPS steps, constant afterwards
+GATE_LR_END=1e-4
+WEIGHT_DECAY=0.01
+TEXT_DROP_PROB=0.1
+MOTION_SUB_LOSS_RATIO=0.1
+VAE_ENCODE_GROUP=8                   # videos per VAE encode call; 1 = per sample
+DATASET_NUM_WORKERS=4
+DATALOADER_PREFETCH_FACTOR=2
+MULTI_CACHE_KEEP=1                   # 1 = keep the multi-edit feature cache at start and exit; not auto-deleted at the end of training either (MULTI_CACHE_DELETE_ON_DONE=0)
+MULTI_CACHE_DELETE_ON_DONE=0
+MULTI_CACHE_DIR=${OUT}/cache_multi   # cache of VAE distribution params + MLLM ctx features for multi-edit (GOKU / CoinVE) samples; visits 2..8 skip decoding / VAE / MLLM
+ZERO_HPZ=1                           # ZeRO++ hpZ intra-node secondary partition size; 1 = off
+VAE_COMPILE=off                      # torch.compile variant for the VAE encoder (off/encoder/encoder_autotune/encode)
+SAVE_STEPS=200
+DS_SAVE_STEPS=200
+NUM_FRAMES=49
+HEIGHT=480
+WIDTH=832
+MAX_PIXELS=399360
+MAX_TRAIN_STEPS=0                    # 0 = derived from the number of epochs
+
+RESUME_DS_STATE=""
+STAGE_ENV=${OUT}/stage.env
+if [ -f "$STAGE_ENV" ]; then
+  source "$STAGE_ENV"
+  echo "[moe-v3.1] stage.env: RESUME_DS_STATE=${RESUME_DS_STATE}"
+fi
+
+# ---- DeepSpeed ZeRO-3 config (every node writes an identical copy)
+DS_CONFIG=${OUT}/ds_zero3.json
+cat > "$DS_CONFIG" <<JSON
+{
+  "bf16": {"enabled": true},
+  "train_micro_batch_size_per_gpu": ${BATCH_SIZE},
+  "gradient_accumulation_steps": 1,
+  "gradient_clipping": 1.0,
+  "steps_per_print": 1000000,
+  "wall_clock_breakdown": false,
+  "zero_allow_untested_optimizer": true,
+  "zero_optimization": {
+    "stage": 3,
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "reduce_bucket_size": 5e8,
+    "sub_group_size": 1e9,
+    "stage3_prefetch_bucket_size": 5e8,
+    "stage3_param_persistence_threshold": 1e5,
+    "stage3_max_live_parameters": 2e9,
+    "stage3_max_reuse_distance": 2e9,
+    "zero_hpz_partition_size": ${ZERO_HPZ},
+    "stage3_gather_16bit_weights_on_model_save": true,
+    "offload_optimizer": {"device": "none"},
+    "offload_param": {"device": "none"}
+  }
+}
+JSON
+echo "[moe-v3.1] batch=${BATCH_SIZE}/GPU  world=${NUM_PROCESSES}  ds=${DS_CONFIG}  attn=${MOE_ATTN_BACKEND}  wandb=${USE_WANDB}"
+
+# ---- multi-edit feature cache cleanup (only when MULTI_CACHE_KEEP=0): on exit (EXIT trap) atomically rename the cache dir and delete it in parallel in the background; leftovers from the previous run are also cleared at start
+cleanup_multi_cache() {
+  local d
+  if [ "$MULTI_CACHE_KEEP" = 1 ]; then return 0; fi
+  if [ -d "$MULTI_CACHE_DIR" ]; then mv "$MULTI_CACHE_DIR" "${MULTI_CACHE_DIR}.del.$$.$(date +%s)" 2>/dev/null || true; fi
+  for d in "${MULTI_CACHE_DIR}".del.*; do
+    [ -d "$d" ] || continue
+    nohup bash -c 'find "$1" -mindepth 1 -maxdepth 1 -print0 | xargs -0 -r -P 16 -n 256 rm -rf; rm -rf "$1"' _ "$d" >/dev/null 2>&1 &
+  done
+}
+trap cleanup_multi_cache EXIT
+cleanup_multi_cache
+
+accelerate launch \
+  --num_processes=${NUM_PROCESSES} --num_machines=${NUM_NODES} --machine_rank=${NODE_RANK} \
+  --main_process_ip=${MASTER_ADDR} --main_process_port=${MASTER_PORT} \
+  --mixed_precision=bf16 \
+  --use_deepspeed --deepspeed_config_file=${DS_CONFIG} --zero3_init_flag=false \
+  --deepspeed_multinode_launcher=standard \
+  scripts/moe/videoeditor-14b/moe_v3_1_train.py \
+  --pretrained_wan_path ${WAN_PATH} \
+  --config_path ${WAN_CONFIG} \
+  --mllm_model ${MLLM_MODEL} \
+  --init_weights ${INIT_WEIGHTS} \
+  --experts_merged ${EXPERTS_MERGED} \
+  --stage_a_data ${STAGE_A_DATA} \
+  --stage_b_data ${STAGE_B_DATA} \
+  --stage_a_epochs ${STAGE_A_EPOCHS} \
+  --stage_b_epochs ${STAGE_B_EPOCHS} \
+  --data_schedule ${DATA_SCHEDULE} --multi_repeat ${MULTI_REPEAT} \
+  --exclude_prompt_words "${EXCLUDE_PROMPT_WORDS}" \
+  --dataset_base_path "${DATASET_BASE}" \
+  --output_dir ${OUT} \
+  --moe_layers ${MOE_LAYERS} --moe_num_experts ${MOE_NUM_EXPERTS} --moe_top_k ${MOE_TOP_K} \
+  --moe_aux_loss_alpha ${MOE_AUX_LOSS_ALPHA} \
+  --batch_size ${BATCH_SIZE} \
+  --learning_rate ${LEARNING_RATE} --new_layers_lr ${NEW_LAYERS_LR} --new_layers_lr_steps ${NEW_LAYERS_LR_STEPS} \
+  --gate_lr ${GATE_LR} --gate_lr_end ${GATE_LR_END} --weight_decay ${WEIGHT_DECAY} \
+  --text_drop_prob ${TEXT_DROP_PROB} --motion_sub_loss_ratio ${MOTION_SUB_LOSS_RATIO} --vae_encode_group ${VAE_ENCODE_GROUP} \
+  --dataset_num_workers ${DATASET_NUM_WORKERS} --dataloader_prefetch_factor ${DATALOADER_PREFETCH_FACTOR} \
+  --multi_cache_dir "${MULTI_CACHE_DIR}" --cache_keep_existing ${MULTI_CACHE_KEEP} --cache_delete_on_done ${MULTI_CACHE_DELETE_ON_DONE} --vae_compile ${VAE_COMPILE} \
+  --save_steps ${SAVE_STEPS} --ds_save_steps ${DS_SAVE_STEPS} \
+  --max_train_steps ${MAX_TRAIN_STEPS} \
+  --resume_ds_state "${RESUME_DS_STATE}" \
+  --use_wandb ${USE_WANDB} --wandb_project ${WANDB_PROJECT} --wandb_run_name ${WANDB_RUN} \
+  --num_frames ${NUM_FRAMES} --height ${HEIGHT} --width ${WIDTH} --max_pixels ${MAX_PIXELS} \
+  --use_gradient_checkpointing 1
