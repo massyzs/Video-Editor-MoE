@@ -146,6 +146,10 @@ def parse_args(argv=None):
     # Training
     p.add_argument("--output_dir", required=True)
     p.add_argument("--batch_size", type=int, default=4, help="per-GPU batch; effective batch = 24 x batch_size")
+    p.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                   help="micro-batches per optimizer update (must equal gradient_accumulation_steps in the DeepSpeed config). One counted step is still one loader batch of "
+                        "world x batch_size samples (data position, checkpoint names, LR schedule and save_steps stay in these units); the optimizer updates only on steps "
+                        "that are multiples of this value, so saves at multiples of save_steps always fall on an update boundary. Not supported together with --ep")
     p.add_argument("--max_train_steps", type=int, default=0, help="0 = derived from the stage epochs")
     p.add_argument("--learning_rate", type=float, default=1e-5, help="base learning rate of full training; original params (including the shared part of MoE layers) always use it")
     p.add_argument("--new_layers_lr", type=float, default=1e-4, help="initial learning rate of new layers (routed experts + gates)")
@@ -1291,6 +1295,11 @@ def main(argv=None):
         if is_main:
             print(f"{TAG} optimizer check: {type(_inner).__name__} adam_w_mode={_mode} wd={[g['weight_decay'] for g in _inner.param_groups]} "
                   f"lr={[g['lr'] for g in _inner.param_groups]}", flush=True)
+    accum = max(1, int(args.gradient_accumulation_steps))
+    assert not (args.ep and accum > 1), "--gradient_accumulation_steps > 1 is not implemented for the EP path (ExpertStore reduces expert grads every backward)"
+    if hasattr(dit, "gradient_accumulation_steps"):
+        assert int(dit.gradient_accumulation_steps()) == accum, \
+            f"DeepSpeed config gradient_accumulation_steps={dit.gradient_accumulation_steps()} != --gradient_accumulation_steps {accum} (engine.backward divides the loss by the config value)"
     if os.environ.get("MOE_DS_STEP_PATCH", "1") == "1" or args.ep:
         apply_ds_step_patches(dit, rank)                         # speed-up, see apply_ds_step_patches (required with EP: the clip factor must include the expert norm)
     if args.ep:
@@ -1444,7 +1453,8 @@ def main(argv=None):
 
     if is_main:
         os.makedirs(os.path.join(args.output_dir, "ckpt"), exist_ok=True)
-        print(f"{TAG} start: world={world} batch={args.batch_size}(effective {world * args.batch_size}) steps={max_steps} "
+        print(f"{TAG} start: world={world} batch={args.batch_size}(effective {world * args.batch_size}"
+              f"{f' per step x accumulation {accum} = {world * args.batch_size * accum} per optimizer update' if accum > 1 else ''}) steps={max_steps} "
               f"moe_layers={args.moe_layers} experts={args.moe_num_experts}(={len(parse_sources(args.expert_sources))} sources x {args.expert_copies} copies, noise {args.expert_copy_noise}) top_k={args.moe_top_k} aux={args.moe_aux_loss_alpha} "
               f"lr base={args.learning_rate} experts={args.new_layers_lr}→{args.learning_rate} gate={args.gate_lr}→{args.gate_lr_end}(linear over the first {args.new_layers_lr_steps} steps) "
               f"text_drop={args.text_drop_prob} motion={args.motion_sub_loss_ratio} "
@@ -1614,6 +1624,12 @@ def main(argv=None):
                 enqueue_cache_payloads(cache_writer, pending, args, step, rank)
 
             # ---- 4. DiT forward (the load-balancing loss is attached to the graph inside the MoE layers), under bf16 autocast
+            # Gradient accumulation: this micro-batch is an update boundary iff the step counter after this batch is a multiple of accum
+            # (accum=1: always). DeepSpeed's engine-level override is mirrored into the ZeRO-3 optimizer, which then accumulates the partitioned
+            # grads across micro-batches and copies them to the fp32 optimizer grads only on the boundary; engine.backward divides the loss by accum.
+            # Skipped batches (guards) do not advance step, so a skipped boundary is simply retried with the next batch and all ranks stay in lockstep.
+            is_boundary = ((step + 1) % accum == 0)
+            dit.set_gradient_accumulation_boundary(is_boundary=is_boundary)
             t_mark = sync_time()
             patch = inner.patch_size
             f_lat, h_lat, w_lat = latents.shape[2:]
@@ -1659,7 +1675,7 @@ def main(argv=None):
             if args.ep:
                 # EP: split accelerate's backward wrapper (engine.backward + engine.step): after backward, compute the expert grads (paired all_reduce + DP shard / world)
                 # and their squared sum, which DeepSpeed's clip patch merges into the global norm; engine.step updates the dense part; then the experts are updated with the same clip factor (sharded CPU Adam + all_gather)
-                dit.set_gradient_accumulation_boundary(is_boundary=True)
+                dit.set_gradient_accumulation_boundary(is_boundary=True)   # EP path: accum == 1 (asserted after prepare)
                 dit.backward(loss)
                 ev_bw = torch.cuda.Event(enable_timing=True); ev_bw.record()   # with EP, bwd = backward only (compute stream); reduction / dense step / expert Adam are timed separately
                 t_ep = time.time()
@@ -1678,15 +1694,17 @@ def main(argv=None):
                 for _k, _v in ep_store.timing.items():                       # clip / cpu_adam / gather stages
                     timing[f"ep_{_k}"] = timing.get(f"ep_{_k}", 0.0) + float(_v)
             else:
-                # exactly equivalent to accelerate's DeepSpeed wrapper (engine.backward + engine.step), split only to launch the next batch's VAE encoding before CPU Adam
-                dit.set_gradient_accumulation_boundary(is_boundary=True)
+                # exactly equivalent to accelerate's DeepSpeed wrapper (engine.backward + engine.step), split only to launch the next batch's VAE encoding before CPU Adam;
+                # with gradient accumulation the engine step (reduce tail / CPU Adam / copy-back) runs only on boundary micro-batches, backward on every one
+                dit.set_gradient_accumulation_boundary(is_boundary=is_boundary)
                 dit.backward(loss)
                 if args.vae_prefetch and prefetched is None:
                     prefetched = fetch_split_encode(step + 1)                # prefetch
-                dit.step()
-                opt.step()
-                opt.zero_grad()
-                if args.opt_probe and is_main and (step + 1) % args.opt_probe == 0:
+                if is_boundary:
+                    dit.step()
+                    opt.step()
+                    opt.zero_grad()
+                if args.opt_probe and is_main and is_boundary and (step + 1) % args.opt_probe == 0:
                     opt_probe(dit, step + 1, TAG)
                 if args.opt_probe_wd0_at and (step + 1) == args.opt_probe_wd0_at:
                     for _g in opt.param_groups:

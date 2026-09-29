@@ -169,7 +169,10 @@ FlashAttention-3. The MLLM encoder uses PyTorch SDPA.
 
 - **Parallelism**: 24 GPUs (3 nodes x 8, 80 GB) train the whole DiT (full fine-tuning) with DeepSpeed ZeRO-3. The run uses the
   ZeRO++ secondary parameter partition inside each node (`ZERO_HPZ=8`) and registers every MoE module as a ZeRO-3 leaf module
-  (`Z3_LEAF=1`). Training runs in bf16 with gradient checkpointing, gradient clipping at 1.0 and no gradient accumulation.
+  (`Z3_LEAF=1`). Training runs in bf16 with gradient checkpointing and gradient clipping at 1.0. The released run used no gradient
+  accumulation; `GRAD_ACCUM=n` in the launcher (`--gradient_accumulation_steps`) accumulates n micro-batches per optimizer update, e.g.
+  to keep the samples per update on fewer GPUs. Steps, checkpoints and `save_steps` keep counting micro-batches (one loader batch of
+  `world x BATCH_SIZE` samples each); the optimizer updates on steps that are multiples of n.
 - **Memory**: optimizer states go to the CPU (`OFFLOAD_OPTIMIZER=cpu`, `DeepSpeedCPUAdam` in AdamW mode, pinned memory), about
   28 GB of host RAM per GPU. Building the model peaks at about 126 GB of host RAM per process, so an 8-GPU node needs about
   1 TB during start-up. Each GPU needs at least 60 GiB free when the trainer starts; the trainer waits up to 10 minutes for it.

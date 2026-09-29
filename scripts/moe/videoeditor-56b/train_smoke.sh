@@ -64,7 +64,8 @@ EXPERT_COPIES=5
 EXPERT_COPY_NOISE=0.01               # each copy = source weight + randn x (weight std x 0.01), fixed seed
 MOE_TOP_K=3                          # top-3 for both self-attention k/v and FFN
 MOE_AUX_LOSS_ALPHA=0.0001
-BATCH_SIZE=4                         # per GPU; effective batch = 24 x 4 = 96, no gradient accumulation
+BATCH_SIZE=4                         # per GPU
+GRAD_ACCUM=1                         # micro-batches per optimizer update (1 = none); samples per update = nodes x 8 x BATCH_SIZE x GRAD_ACCUM
 LEARNING_RATE=1e-5                   # base learning rate (all original parameters)
 NEW_LAYERS_LR=1e-4                   # experts: start lr, linearly decayed to LEARNING_RATE over NEW_LAYERS_LR_STEPS
 NEW_LAYERS_LR_STEPS=2000
@@ -171,7 +172,7 @@ cat > "$DS_CONFIG" <<EOF
 {
   "bf16": {"enabled": true},
   "train_micro_batch_size_per_gpu": ${BATCH_SIZE},
-  "gradient_accumulation_steps": 1,
+  "gradient_accumulation_steps": ${GRAD_ACCUM},
   "gradient_clipping": 1.0,
   "steps_per_print": 1000000,
   "wall_clock_breakdown": false,
@@ -234,7 +235,7 @@ accelerate launch \
   --moe_layers ${MOE_LAYERS} --moe_num_experts ${MOE_NUM_EXPERTS} --moe_top_k ${MOE_TOP_K} \
   --expert_sources ${EXPERT_SOURCES} --expert_copies ${EXPERT_COPIES} --expert_copy_noise ${EXPERT_COPY_NOISE} \
   --moe_aux_loss_alpha ${MOE_AUX_LOSS_ALPHA} --cpu_adam ${CPU_ADAM} --final_save ${FINAL_SAVE} --ds_config ${DS_CONFIG} --z3_leaf_modules ${Z3_LEAF} --mllm_attn_impl ${MLLM_ATTN_IMPL} \
-  --batch_size ${BATCH_SIZE} \
+  --batch_size ${BATCH_SIZE} --gradient_accumulation_steps ${GRAD_ACCUM} \
   --learning_rate ${LEARNING_RATE} --new_layers_lr ${NEW_LAYERS_LR} --new_layers_lr_steps ${NEW_LAYERS_LR_STEPS} \
   --gate_lr ${GATE_LR} --gate_lr_end ${GATE_LR_END} --weight_decay ${WEIGHT_DECAY} \
   --text_drop_prob ${TEXT_DROP_PROB} --motion_sub_loss_ratio ${MOTION_SUB_LOSS_RATIO} --vae_encode_group ${VAE_ENCODE_GROUP} \
