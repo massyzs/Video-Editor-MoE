@@ -33,3 +33,6 @@ nohup.out
 .vscode/
 .DS_Store
 .nfs*
+
+# local, cluster-specific launcher copies
+*.local.sh
