@@ -91,7 +91,9 @@ def parse_args(argv=None):
     p.add_argument("--config_path", required=True)
     p.add_argument("--mllm_model", required=True)
     p.add_argument("--init_weights", required=True, help="moe_expert_init.safetensors(connector / query / vae_condition)")
-    p.add_argument("--experts_merged", required=True, help="output experts_v3_1.safetensors of merge_experts_v3_1.py (videoeditor-14b directory)")
+    p.add_argument("--experts_merged", required=True, help="output experts_v3_1.safetensors of merge_experts_v3_1.py (videoeditor-14b directory); \"\" with --resume_weights = experts come from the checkpoint")
+    p.add_argument("--fast_init", type=int, default=1, help="with --resume_weights (not EP): skip torch.nn.init during construction (single-threaded random init of 55.9B parameters is most of the "
+                        "~10 min build); the checkpoint must then cover every parameter (asserted) and the finiteness scan runs after loading")
     p.add_argument("--use_gradient_checkpointing", type=int, default=1)
     # MoE
     p.add_argument("--moe_layers", default="1,3,5,7,9,11,13,15,17,19,21,23,25,27", help="0-based block indices = layers 2,4,...,28 in 1-based counting")
@@ -407,7 +409,10 @@ def cache_payload_of(sample, expect=None):
     if out["ctx_cond"].shape[1] != out["ctx_null"].shape[1]:
         return None
     if expect:
-        if expect.get("latent") is not None and tuple(out["src_mean"].shape) != tuple(expect["latent"]):
+        exp_lat = expect.get("latent")
+        if isinstance(exp_lat, dict):                                   # per frame count (121 / 81 batches have different latent f)
+            exp_lat = exp_lat.get(int(sample.get("num_frames_eff") or 0))
+        if exp_lat is not None and tuple(out["src_mean"].shape) != tuple(exp_lat):
             return None
         if expect.get("ctx") is not None and int(out["ctx_cond"].shape[1]) != int(expect["ctx"]):
             return None
@@ -429,7 +434,7 @@ def multi_cache_path_of(sample, cache_dir, args):
         src, tgt = sample.get("src_video_path"), sample.get("tgt_video_path")
         if not src or not tgt:
             return None
-        key = multi_cache_key(src, tgt, prompt_of(sample), args.num_frames, args.height, args.width)
+        key = multi_cache_key(src, tgt, prompt_of(sample), int(sample.get("num_frames_eff") or args.num_frames), args.height, args.width)
     return os.path.join(cache_dir, key + ".st")     # safetensors layout, suffix .st
 
 
@@ -480,7 +485,9 @@ def encode_latents_with_cache(vae, batch, payloads, pending, args, device, dtype
             src_rows[i], tgt_rows[i] = src_u[k], tgt_u[k]
             if pending[i] is not None:
                 pending[i].update(src_mean=src_mean[k], src_logvar=src_logvar[k], tgt_mean=tgt_mean[k], tgt_logvar=tgt_logvar[k])
-        if cache_expect.get("latent") is None:
+        if isinstance(cache_expect.get("latent"), dict):
+            cache_expect["latent"].setdefault(int(batch[idx_u[0]].get("num_frames_eff") or args.num_frames), tuple(src_u.shape[1:]))   # per frame count
+        elif cache_expect.get("latent") is None:
             cache_expect["latent"] = tuple(src_u.shape[1:])            # later hit samples must match this shape (checked in cache_payload_of)
     if idx_c:
         src_c = sample_cached_latents([payloads[i] for i in idx_c], "src_mean", "src_logvar", device, dtype)
@@ -567,7 +574,7 @@ def build_cache_payload(pending, args, step, rank):
     # .to("cpu", bf16).contiguous() does not copy a tensor that is already CPU bf16, so src_mean etc. would remain views of the large VAE moments storage and torch.save would write the whole storage (37 MB vs 14 MB)
     out = {k: pending[k].detach().to("cpu", torch.bfloat16, copy=True, memory_format=torch.contiguous_format) for k in CACHE_TENSOR_KEYS}
     out["meta"] = {"key": os.path.basename(pending["path"])[:-3], "src_video": sample.get("src_video_path"), "tgt_video": sample.get("tgt_video_path"),
-                   "prompt": prompt_of(sample), "num_frames": int(args.num_frames), "height": int(args.height), "width": int(args.width),
+                   "prompt": prompt_of(sample), "num_frames": int(sample.get("num_frames_eff") or args.num_frames), "height": int(args.height), "width": int(args.width),
                    "latent_shape": list(out["src_mean"].shape), "version": CACHE_VERSION, "step": int(step), "rank": int(rank)}
     return out
 
@@ -887,6 +894,8 @@ def load_records(meta_paths, exclude_words, joiner, repeats=None, cache_groups=N
                             "turn_types_qwen": [category_of(record)]}      # the category is only for the "category x expert" log matrix; carried unchanged through the dataset into the sample
             if cache_group:
                 record_out["cache_group"] = cache_group                   # cache: passed to the dataset through the temporary jsonl (json.dumps writes extra fields)
+            if record.get("num_frames_bucket"):
+                record_out["num_frames_bucket"] = int(record["num_frames_bucket"])   # per-sample frame count from the frame census (121 / 81)
             records.extend([record_out] * repeat)
             kept += 1
         stats.append(f"{os.path.basename(meta_path)}:{kept}" + (f"×{repeat}" if repeat != 1 else "") + f"(dropped {dropped})")
@@ -922,6 +931,61 @@ def build_dataset(meta_paths, exclude_words, args, repeats=None, cache_groups=No
     os.unlink(merged_path)
     assert len(dataset) == len(records), f"dataset filtered out {len(records) - len(dataset)} records"
     return dataset, stats
+
+
+
+class BucketedShardedBatchSampler:
+    """Variant of ShardedBatchSampler for per-sample frame counts (record field num_frames_bucket, e.g. 121 / 81): every batch holds samples of ONE
+    frame count and all ranks process the SAME frame count in a given step (one global batch of world x batch_size samples is cut per step and
+    sliced per rank), so tensors stack and the per-step cost is uniform across ranks. Per epoch: each bucket is shuffled with seed+epoch and cut into
+    global batches (its incomplete tail is dropped), then the step order over all buckets is shuffled with the same generator. Same interface as
+    ShardedBatchSampler (set_epoch / persistent skip / epoch_batches for the data-position self-check / __len__ identical on every rank)."""
+
+    def __init__(self, num_samples, batch_size, num_replicas, rank, seed, buckets):
+        assert len(buckets) == num_samples, (len(buckets), num_samples)
+        self.num_samples, self.batch_size = num_samples, batch_size
+        self.num_replicas, self.rank, self.seed = num_replicas, rank, seed
+        self.epoch, self.skip = 0, 0
+        self.bucket_values = sorted(set(int(b) for b in buckets))
+        import numpy as _np
+        _arr = _np.asarray(buckets)
+        self._by_bucket = {b: torch.from_numpy(_np.flatnonzero(_arr == b)) for b in self.bucket_values}
+        gb = self.batch_size * self.num_replicas
+        self.steps_per_bucket = {b: int(len(v)) // gb for b, v in self._by_bucket.items()}
+        self._len = sum(self.steps_per_bucket.values())
+        self._cache_epoch, self._cache = None, None
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        return self._len
+
+    def epoch_global(self):
+        """[(bucket, LongTensor[world x batch_size])] per step of the current epoch (deterministic in seed + epoch, identical on every rank)."""
+        if self._cache_epoch == self.epoch:
+            return self._cache
+        generator = torch.Generator().manual_seed(self.seed * 100003 + self.epoch)
+        gb = self.batch_size * self.num_replicas
+        steps = []
+        for b in self.bucket_values:                                   # fixed bucket order, then one shared permutation of the steps
+            idx = self._by_bucket[b]
+            perm = idx[torch.randperm(len(idx), generator=generator)]
+            steps += [(b, perm[i * gb:(i + 1) * gb]) for i in range(self.steps_per_bucket[b])]
+        order = torch.randperm(len(steps), generator=generator).tolist()
+        self._cache_epoch, self._cache = self.epoch, [steps[i] for i in order]
+        return self._cache
+
+    def epoch_batches(self):
+        """This rank's batches of the current epoch (index = step within the epoch), each a list of dataset indices of one frame count."""
+        r0 = self.rank * self.batch_size
+        return [g[r0:r0 + self.batch_size].tolist() for _, g in self.epoch_global()]
+
+    def epoch_buckets(self):
+        return [b for b, _ in self.epoch_global()]
+
+    def __iter__(self):
+        return iter(self.epoch_batches()[self.skip:])
 
 
 class IndexTaggedDataset(torch.utils.data.Dataset):
@@ -1219,7 +1283,39 @@ def main(argv=None):
         EPM.install(None, ep_layout)
         if is_main:
             print(f"{TAG} {ep_layout.describe()}", flush=True)
-    dit = build_checked(lambda: build_dit(args, dtype, verbose=is_main), "DiT", rank)
+    fast = bool(int(getattr(args, "fast_init", 1))) and bool(args.resume_weights) and not args.ep
+    if fast:
+        # Speed-up: no-op random init during construction (the checkpoint overwrites every parameter, asserted below); build_checked's finiteness scan is
+        # meaningless on uninitialised memory, so the scan (and its rebuild-on-corruption retry) is applied after the weights are loaded instead.
+        import torch.nn.init as _init
+        _saved = {}
+        for _fn in ("xavier_uniform_", "xavier_normal_", "normal_", "kaiming_uniform_", "kaiming_normal_", "uniform_", "trunc_normal_"):
+            if hasattr(_init, _fn):
+                _saved[_fn] = getattr(_init, _fn); setattr(_init, _fn, lambda t, *aa, **kk: t)
+        t_fast = time.time()
+        try:
+            dit = build_dit(args, dtype, verbose=is_main)
+        finally:
+            for _fn, _f in _saved.items():
+                setattr(_init, _fn, _f)
+        from safetensors import safe_open as _safe_open
+        with _safe_open(args.resume_weights, framework="pt", device="cpu") as _f:
+            _ck_keys = set(_f.keys())
+        _missing = sorted(n for n, _ in dit.named_parameters() if n not in _ck_keys)
+        assert not _missing, f"--fast_init needs a checkpoint covering every parameter; {len(_missing)} missing, e.g. {_missing[:3]}"
+        for _attempt in range(1, 4):
+            load_trainable_weights(dit, args.resume_weights)
+            _bad = [n for n, q in dit.named_parameters() if not torch.isfinite(q).all()]
+            _bad += [n for n, b in dit.named_buffers() if b.is_floating_point() and not torch.isfinite(b).all()]
+            if not _bad:
+                break
+            print(f"{TAG} rank{rank}: DiT has {len(_bad)} non-finite tensors after loading (e.g. {_bad[:2]}), reload attempt {_attempt}", flush=True)
+            if _attempt == 3:
+                raise RuntimeError(f"DiT had non-finite weights in 3 consecutive loads, rank{rank} exiting")
+        if is_main:
+            print(f"{TAG} fast_init: built without random init and loaded {args.resume_weights} ({len(_ck_keys)} tensors, every parameter covered) in {time.time() - t_fast:.0f}s", flush=True)
+    else:
+        dit = build_checked(lambda: build_dit(args, dtype, verbose=is_main), "DiT", rank)
     if args.ep:
         moe_layers_list = [int(s) for s in str(args.moe_layers).split(",") if s.strip()]
         blk = dit.blocks[moe_layers_list[0]]
@@ -1236,7 +1332,7 @@ def main(argv=None):
             ep_store.load_from_safetensors(args.resume_weights, verbose=is_main)
             if is_main:
                 print(f"{TAG} EP loaded weights {args.resume_weights}: {n_dense} dense keys + this GPU's experts", flush=True)
-        else:
+        elif not fast:                                                     # fast path already loaded (and scanned) above
             load_trainable_weights(dit, args.resume_weights)
         if is_main:
             print(f"{TAG} loaded weights {args.resume_weights}", flush=True)
@@ -1398,7 +1494,14 @@ def main(argv=None):
     gc.collect()
     gc.freeze()
     for name, dataset, stats, epochs in built:
-        sampler = ShardedBatchSampler(len(dataset), args.batch_size, world, rank, args.seed)
+        _buckets = dataset.frame_buckets()                                 # per-sample frame counts (num_frames_bucket records), one value = old behaviour
+        if len(set(_buckets)) > 1:
+            sampler = BucketedShardedBatchSampler(len(dataset), args.batch_size, world, rank, args.seed, _buckets)
+            if is_main:
+                _bcount = {b: int(len(sampler._by_bucket[b])) for b in sampler.bucket_values}
+                print(f"{TAG} stage {name}: frame buckets {_bcount} samples -> steps/epoch per bucket {sampler.steps_per_bucket} (batches homogeneous in frame count)", flush=True)
+        else:
+            sampler = ShardedBatchSampler(len(dataset), args.batch_size, world, rank, args.seed)
         loader = DataLoader(IndexTaggedDataset(dataset), batch_sampler=sampler, num_workers=args.dataset_num_workers,
                             prefetch_factor=args.dataloader_prefetch_factor or None, collate_fn=lambda b: b,
                             persistent_workers=bool(args.dataset_num_workers))
@@ -1482,7 +1585,7 @@ def main(argv=None):
     per_moe = len(moe_ffns) * num_experts
     cache_off = NUM_LOSS_SLOTS + 2 * per_moe                                  # cache: cache counter slots start here (appended at the end; NUM_LOSS_SLOTS and the MoE offsets are unchanged)
     stat = torch.zeros(cache_off + len(CACHE_STAT_NAMES), device=device)
-    cache_expect = {"latent": None, "ctx": None}                              # cache: latent shape and ctx dim are recorded after the first VAE / MLLM encode of this run; hit samples must match
+    cache_expect = {"latent": {}, "ctx": None}                              # cache: latent shape and ctx dim are recorded after the first VAE / MLLM encode of this run; hit samples must match
     # "category x expert" selection counts (summed over all MoE layers): [kind=2 (attn, ffn), category, expert]; every 10 steps reduced and row-normalized to P(expert i selected | sample category c)
     moe_kinds = [("attn", moe_attns), ("ffn", moe_ffns)]
     cat_stat = torch.zeros(len(moe_kinds), len(CATEGORIES), num_experts, device=device)
@@ -1490,6 +1593,7 @@ def main(argv=None):
     skipped_steps = 0                   # steps skipped due to bad samples / non-finite loss (not counted in step)
     consecutive_bad = 0                 # consecutive non-finite-loss steps on this rank; 5 in a row means this process's weights are bad, so exit for inspection
     step, t0 = step0, time.time()
+    frames_sum, frames_n = 0.0, 0                                        # mean frame count of the steps in the logging window
     dit.train()
 
     while step < max_steps:
@@ -1525,6 +1629,13 @@ def main(argv=None):
                 if is_main:
                     print(f"{TAG} data-position self-check OK: stage {stage['name']} epoch {stage['sampler'].epoch} first batch = batch {check_pos} of this epoch (sample indices {expect[:3]}...)", flush=True)
                 check_pos = None
+            # ---- homogeneous frame count guard (defence in depth): the sampler cuts batches per frame bucket and the dataset replaces failed samples within the
+            #      same bucket; should a sample with another frame count still appear, drop it instead of crashing in the stack (seen 10/21-10/23 before the dataset fix)
+            if nb and len({int(s_.get("num_frames_eff") or 0) for s_ in nb}) > 1:
+                _nf_major = max({int(s_.get("num_frames_eff") or 0) for s_ in nb}, key=lambda v: sum(1 for s_ in nb if int(s_.get("num_frames_eff") or 0) == v))
+                _odd = [s_ for s_ in nb if int(s_.get("num_frames_eff") or 0) != _nf_major]
+                print(f"{TAG} rank{rank}: dropping {len(_odd)} sample(s) whose frame count differs from the batch ({_nf_major}): {[s_.get('src_video_path') for s_ in _odd]}", flush=True)
+                nb = [s_ for s_ in nb if int(s_.get("num_frames_eff") or 0) == _nf_major]
             # ---- 0. Cache split. Hit samples (the dataset worker read a cache file; they carry a "cache" key) have no pixels, only VAE distribution params + both ctx branches;
             #      payloads[i] = tensors of a hit sample / None, pending[i] = missed sample in a cache group (written to the cache after this step) / None; both are filtered together with guard drops
             nb, npl, npd, ncc = split_batch_for_cache(nb, cache_dir if cache_writer is not None else "", args, cache_expect, rank, step_for_log)
@@ -1716,6 +1827,7 @@ def main(argv=None):
             timing["fwd"] += ev_f0.elapsed_time(ev_f1) / 1000.0        # sync_time already synchronized, reading the events does not wait
             timing["bwd"] += ev_b0.elapsed_time(ev_bw if args.ep else ev_b1) / 1000.0   # EP: backward only; otherwise backward + step
             timing["n"] += 1
+            frames_sum += float(batch[0].get("num_frames_eff") or args.num_frames) if batch else 0.0; frames_n += 1
             step += 1
 
             # ---- 7. statistics and logging
@@ -1751,7 +1863,7 @@ def main(argv=None):
                                "loss/aux_attn": totals[2] / count, "loss/aux_ffn": totals[3] / count, "loss/aux": (totals[2] + totals[3]) / count,
                                "loss/total": totals[4] / count,
                                "lr/base": args.learning_rate, "lr/new_layers": lr_new, "lr/gate": lr_gate,
-                               "skipped_steps": skipped_steps, "stage": stage_index,
+                               "skipped_steps": skipped_steps, "stage": stage_index, "data/frames_mean": frames_sum / max(frames_n, 1),
                                "mem/alloc_max_gb": mem[0] / 2 ** 30, "mem/reserved_max_gb": mem[1] / 2 ** 30}
                     # one folder per MoE layer (moe_attn_L{block} / moe_ffn_L{block}) with one curve per expert: fraction of tokens selecting it
                     summary = {}
@@ -1816,10 +1928,11 @@ def main(argv=None):
                           + (f", ep_red/ds_step/ep_opt={timing['ep_red'] / max(timing['n'], 1):.1f}/{timing['ds_step'] / max(timing['n'], 1):.1f}/"
                              f"{timing['ep_opt'] / max(timing['n'], 1):.1f}s(clip/adam/gather={timing.get('ep_clip', 0.0) / max(timing['n'], 1):.1f}/"
                              f"{timing.get('ep_cpu_adam', 0.0) / max(timing['n'], 1):.1f}/{timing.get('ep_gather', 0.0) / max(timing['n'], 1):.1f})" if args.ep else "") + ") "
-                          f"mem={mem[0] / 2 ** 30:.1f}/{mem[1] / 2 ** 30:.1f}GiB "
+                          f"mem={mem[0] / 2 ** 30:.1f}/{mem[1] / 2 ** 30:.1f}GiB frames={frames_sum / max(frames_n, 1):.0f} "
                           + " ".join(spread_note) + (" " + cache_note if cache_note else ""), flush=True)
                 stat.zero_()
                 cat_stat.zero_()
+                frames_sum, frames_n = 0.0, 0
                 for _k in timing:
                     timing[_k] = 0.0
                 timing["n"] = 0
@@ -1844,6 +1957,7 @@ def main(argv=None):
         cache_writer.close()
         accelerator.wait_for_everyone()
         if is_main and not args.cache_delete_on_done:   # do not delete automatically at the end; leave the decision to the user
+            os.makedirs(os.path.join(args.output_dir, "flags"), exist_ok=True)
             with open(os.path.join(args.output_dir, "flags", "CACHE_KEPT_ASK_USER"), "w") as f:
                 f.write(f"{time.strftime('%F %T')} training finished, cache directory {cache_dir} kept; the user decides whether to delete it\n")
             print(f"{TAG} cache: training finished, cache directory {cache_dir} kept (--cache_delete_on_done 0); delete it manually if no longer needed", flush=True)

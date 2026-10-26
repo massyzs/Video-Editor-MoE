@@ -305,6 +305,32 @@ class KiwiEditDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data) * self.repeat
 
+    def frames_of_row(self, row) -> int:
+        """Frame count for one record: its num_frames_bucket field if present (> 0), else the dataset-wide num_frames."""
+        try:
+            nf = int(row.get("num_frames_bucket") or 0)
+        except (TypeError, ValueError):
+            nf = 0
+        return nf if nf > 0 else int(self.num_frames)
+
+    def _same_bucket_random(self, idx):
+        """Replacement index for a sample that failed to load: a random record with the SAME frame count as the requested one.
+        (A plain random record could belong to the other frame bucket and the batch would then mix 81- and 121-frame clips -> stacking error, seen 10/21-10/23.)"""
+        nf = self.frames_of_row(self.data[idx % len(self.data)])
+        pools = getattr(self, "_bucket_pools", None)
+        if pools is None:
+            pools = {}
+            for i, row in enumerate(self.data):
+                pools.setdefault(self.frames_of_row(row), []).append(i)
+            self._bucket_pools = pools
+        pool = pools.get(nf)
+        return random.choice(pool) if pool else random.randint(0, len(self.data) - 1)
+
+    def frame_buckets(self):
+        """Per-index frame count (length = len(self), honouring repeat), for samplers that keep batches homogeneous in frame count."""
+        base = [self.frames_of_row(row) for row in self.data]
+        return base * self.repeat if self.repeat != 1 else base
+
     def _resolve(self, p: str) -> str:
         if os.path.isabs(p):
             return p
@@ -372,16 +398,19 @@ class KiwiEditDataset(Dataset):
                 prompt = row.get("prompt") or row.get("text") or ""
                 src_path = self._resolve(row["src_video"])
                 tgt_path = self._resolve(row["tgt_video"])
+                # Per-sample frame count: a record may carry num_frames_bucket (e.g. 121 for clips that really have 121 frames, 81 otherwise, assigned by a
+                # frame census); it overrides the dataset-wide num_frames for loading and padding. The sampler keeps batches homogeneous in this value.
+                nf = self.frames_of_row(row)
 
                 src_frames = _load_path(
                     src_path,
-                    num_frames=self.num_frames,
+                    num_frames=nf,
                     time_div=self.time_division_factor,
                     time_rem=self.time_division_remainder,
                 )
                 tgt_frames = _load_path(
                     tgt_path,
-                    num_frames=self.num_frames,
+                    num_frames=nf,
                     time_div=self.time_division_factor,
                     time_rem=self.time_division_remainder,
                 )
@@ -397,8 +426,8 @@ class KiwiEditDataset(Dataset):
 
                 # Fixed length for true batching: pad videos shorter than num_frames to exactly num_frames by REPEATING the last frame,
                 # src/tgt padded identically (paired, so the "edit" on padded frames stays consistent). Videos only (num_frames>1).
-                if self.pad_frames_to_num and self.num_frames > 1 and len(src_frames) < self.num_frames:
-                    pad_n = self.num_frames - len(src_frames)
+                if self.pad_frames_to_num and nf > 1 and len(src_frames) < nf:
+                    pad_n = nf - len(src_frames)
                     src_frames = src_frames + [src_frames[-1]] * pad_n
                     tgt_frames = tgt_frames + [tgt_frames[-1]] * pad_n
 
@@ -422,6 +451,7 @@ class KiwiEditDataset(Dataset):
                 if not self.return_pixels:
                     return {
                         "prompt": prompt,
+                        "num_frames_eff": nf,                 # frame count this sample was loaded/padded to (feature-cache key, homogeneous batches)
                         "src_video_path": row["src_video"],   # original relative path (feature-cache key)
                         "src_video": src_frames,
                         "tgt_video": tgt_frames,
@@ -442,6 +472,7 @@ class KiwiEditDataset(Dataset):
                 from videox_fun.data.kiwi_video_utils import frames_to_uint8_tensor
                 return {
                     "prompt": prompt,
+                    "num_frames_eff": nf,                 # frame count this sample was loaded/padded to (feature-cache key, homogeneous batches)
                     "src_video_path": row["src_video"],   # original relative path (feature-cache key)
                     "src_video": src_frames if self.src_pil else None,   # speed-up: src_pil=False skips PIL (main process rebuilds from src_pixels)
                     "tgt_video": None,
@@ -455,7 +486,7 @@ class KiwiEditDataset(Dataset):
                     f"KiwiEditDataset: error {retry}/{max_retry} loading idx {idx}: {e}",
                 )
                 _vis_warn(f"sample load failed {retry}/{max_retry} idx={idx}: {str(e)[:160]}")
-                idx = random.randint(0, len(self.data) - 1)
+                idx = self._same_bucket_random(idx)   # replacement must keep the frame count: batches are homogeneous per frame bucket
         raise RuntimeError(
             f"KiwiEditDataset: failed to load any data after {max_retry} retries."
         )

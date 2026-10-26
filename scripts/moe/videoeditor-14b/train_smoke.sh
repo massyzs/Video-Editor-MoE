@@ -102,6 +102,8 @@ MOE_TOP_K=3                          # top-3 for both self-attention k/v and the
 MOE_AUX_LOSS_ALPHA=0.0001
 
 BATCH_SIZE=1                         # per GPU; effective batch = 8 x 1 = 8
+GRAD_ACCUM=1                         # micro-batches per optimizer update (1 = none); samples per update = nodes x 8 x BATCH_SIZE x GRAD_ACCUM
+MLLM_ATTN_IMPL=sdpa                  # Qwen backbone attention; flash_attention_2 produced random NaNs in our environment (auto = original behaviour)
 LEARNING_RATE=1e-5                   # base learning rate of full fine-tuning; the original parameters always use it
 NEW_LAYERS_LR=1e-4                   # starting lr of the new layers (routed experts + gates), decayed linearly to LEARNING_RATE over the first NEW_LAYERS_LR_STEPS steps
 NEW_LAYERS_LR_STEPS=2000
@@ -120,6 +122,7 @@ MAX_PIXELS=399360
 MAX_TRAIN_STEPS=6                    # 0 = derived from the number of epochs
 
 RESUME_DS_STATE=""
+RESUME_WEIGHTS=""                    # weights-only start from a trained checkpoint (moe_v3_1_trainable.safetensors): fresh optimizer, step counter and data order; set EXPERTS_MERGED="" with it
 STAGE_ENV=${OUT}/stage.env
 if [ -f "$STAGE_ENV" ]; then
   source "$STAGE_ENV"
@@ -132,7 +135,7 @@ cat > "$DS_CONFIG" <<JSON
 {
   "bf16": {"enabled": true},
   "train_micro_batch_size_per_gpu": ${BATCH_SIZE},
-  "gradient_accumulation_steps": 1,
+  "gradient_accumulation_steps": ${GRAD_ACCUM},
   "gradient_clipping": 1.0,
   "steps_per_print": 1000000,
   "wall_clock_breakdown": false,
@@ -166,7 +169,7 @@ accelerate launch \
   --config_path ${WAN_CONFIG} \
   --mllm_model ${MLLM_MODEL} \
   --init_weights ${INIT_WEIGHTS} \
-  --experts_merged ${EXPERTS_MERGED} \
+  --experts_merged "${EXPERTS_MERGED}" \
   --stage_a_data ${STAGE_A_DATA} \
   --stage_b_data ${STAGE_B_DATA} \
   --stage_a_epochs ${STAGE_A_EPOCHS} \
@@ -177,13 +180,13 @@ accelerate launch \
   --output_dir ${OUT} \
   --moe_layers ${MOE_LAYERS} --moe_num_experts ${MOE_NUM_EXPERTS} --moe_top_k ${MOE_TOP_K} \
   --moe_aux_loss_alpha ${MOE_AUX_LOSS_ALPHA} \
-  --batch_size ${BATCH_SIZE} \
+  --batch_size ${BATCH_SIZE} --gradient_accumulation_steps ${GRAD_ACCUM} --mllm_attn_impl ${MLLM_ATTN_IMPL} \
   --learning_rate ${LEARNING_RATE} --new_layers_lr ${NEW_LAYERS_LR} --new_layers_lr_steps ${NEW_LAYERS_LR_STEPS} \
   --gate_lr ${GATE_LR} --gate_lr_end ${GATE_LR_END} --weight_decay ${WEIGHT_DECAY} \
   --text_drop_prob ${TEXT_DROP_PROB} --motion_sub_loss_ratio ${MOTION_SUB_LOSS_RATIO} --vae_encode_group ${VAE_ENCODE_GROUP} \
   --save_steps ${SAVE_STEPS} --ds_save_steps ${DS_SAVE_STEPS} \
   --max_train_steps ${MAX_TRAIN_STEPS} \
-  --resume_ds_state "${RESUME_DS_STATE}" \
+  --resume_ds_state "${RESUME_DS_STATE}" --resume_weights "${RESUME_WEIGHTS}" \
   --use_wandb ${USE_WANDB} --wandb_project ${WANDB_PROJECT} --wandb_run_name ${WANDB_RUN} \
   --num_frames ${NUM_FRAMES} --height ${HEIGHT} --width ${WIDTH} --max_pixels ${MAX_PIXELS} \
   --use_gradient_checkpointing 1

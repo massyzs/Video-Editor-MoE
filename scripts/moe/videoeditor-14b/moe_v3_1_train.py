@@ -111,6 +111,11 @@ def parse_args(argv=None):
     # Training
     p.add_argument("--output_dir", required=True)
     p.add_argument("--batch_size", type=int, default=4, help="per-GPU batch; effective batch = 24 × batch_size")
+    p.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                   help="micro-batches per optimizer update (must equal gradient_accumulation_steps in the DeepSpeed config). One counted step is still one loader batch of "
+                        "world x batch_size samples (data position, checkpoint names, LR schedule and save_steps stay in these units); the optimizer updates only on steps "
+                        "that are multiples of this value, so saves at multiples of save_steps always fall on an update boundary")
+    p.add_argument("--mllm_attn_impl", default="sdpa", help="attention implementation of the Qwen backbone; flash_attention_2 produced random NaNs in our environment (see build_mllm), default sdpa; auto = original behaviour")
     p.add_argument("--max_train_steps", type=int, default=0, help="0 = derived from the stage epochs")
     p.add_argument("--learning_rate", type=float, default=1e-5, help="base learning rate of full training; original params (incl. the shared part of MoE layers) always use it")
     p.add_argument("--new_layers_lr", type=float, default=1e-4, help="initial learning rate of the new layers (routed experts + gates)")
@@ -261,7 +266,10 @@ def cache_payload_of(sample, expect=None):
     if out["ctx_cond"].shape[1] != out["ctx_null"].shape[1]:
         return None
     if expect:
-        if expect.get("latent") is not None and tuple(out["src_mean"].shape) != tuple(expect["latent"]):
+        exp_lat = expect.get("latent")
+        if isinstance(exp_lat, dict):                                   # per frame count (121 / 81 batches have different latent f)
+            exp_lat = exp_lat.get(int(sample.get("num_frames_eff") or 0))
+        if exp_lat is not None and tuple(out["src_mean"].shape) != tuple(exp_lat):
             return None
         if expect.get("ctx") is not None and int(out["ctx_cond"].shape[1]) != int(expect["ctx"]):
             return None
@@ -283,7 +291,7 @@ def multi_cache_path_of(sample, cache_dir, args):
         src, tgt = sample.get("src_video_path"), sample.get("tgt_video_path")
         if not src or not tgt:
             return None
-        key = multi_cache_key(src, tgt, prompt_of(sample), args.num_frames, args.height, args.width)
+        key = multi_cache_key(src, tgt, prompt_of(sample), int(sample.get("num_frames_eff") or args.num_frames), args.height, args.width)
     return os.path.join(cache_dir, key + ".st")     # safetensors layout, suffix .st
 
 
@@ -334,7 +342,9 @@ def encode_latents_with_cache(vae, batch, payloads, pending, args, device, dtype
             src_rows[i], tgt_rows[i] = src_u[k], tgt_u[k]
             if pending[i] is not None:
                 pending[i].update(src_mean=src_mean[k], src_logvar=src_logvar[k], tgt_mean=tgt_mean[k], tgt_logvar=tgt_logvar[k])
-        if cache_expect.get("latent") is None:
+        if isinstance(cache_expect.get("latent"), dict):
+            cache_expect["latent"].setdefault(int(batch[idx_u[0]].get("num_frames_eff") or args.num_frames), tuple(src_u.shape[1:]))   # per frame count
+        elif cache_expect.get("latent") is None:
             cache_expect["latent"] = tuple(src_u.shape[1:])            # later cache hits must match this shape (checked in cache_payload_of)
     if idx_c:
         src_c = sample_cached_latents([payloads[i] for i in idx_c], "src_mean", "src_logvar", device, dtype)
@@ -407,7 +417,7 @@ def build_cache_payload(pending, args, step, rank):
     # A plain .to("cpu", bf16).contiguous() does not copy a tensor that is already CPU bf16, so src_mean etc. stay views of the large VAE moments storage and the whole storage gets written (37 MB vs 14 MB)
     out = {k: pending[k].detach().to("cpu", torch.bfloat16, copy=True, memory_format=torch.contiguous_format) for k in CACHE_TENSOR_KEYS}
     out["meta"] = {"key": os.path.basename(pending["path"])[:-3], "src_video": sample.get("src_video_path"), "tgt_video": sample.get("tgt_video_path"),
-                   "prompt": prompt_of(sample), "num_frames": int(args.num_frames), "height": int(args.height), "width": int(args.width),
+                   "prompt": prompt_of(sample), "num_frames": int(sample.get("num_frames_eff") or args.num_frames), "height": int(args.height), "width": int(args.width),
                    "latent_shape": list(out["src_mean"].shape), "version": CACHE_VERSION, "step": int(step), "rank": int(rank)}
     return out
 
@@ -727,6 +737,8 @@ def load_records(meta_paths, exclude_words, joiner, repeats=None, cache_groups=N
                             "turn_types_qwen": [category_of(record)]}      # category is only for the "category × expert" log matrix, passed through the dataset unchanged
             if cache_group:
                 record_out["cache_group"] = cache_group                   # reaches the dataset unchanged via the temp jsonl (json.dumps writes extra fields)
+            if record.get("num_frames_bucket"):
+                record_out["num_frames_bucket"] = int(record["num_frames_bucket"])   # per-sample frame count from the frame census (121 / 81)
             records.extend([record_out] * repeat)
             kept += 1
         stats.append(f"{os.path.basename(meta_path)}:{kept}" + (f"×{repeat}" if repeat != 1 else "") + f"(dropped {dropped})")
@@ -756,6 +768,61 @@ def build_dataset(meta_paths, exclude_words, args, repeats=None, cache_groups=No
     os.unlink(merged_path)
     assert len(dataset) == len(records), f"dataset filtered out {len(records) - len(dataset)} records"
     return dataset, stats
+
+
+
+class BucketedShardedBatchSampler:
+    """Variant of ShardedBatchSampler for per-sample frame counts (record field num_frames_bucket, e.g. 121 / 81): every batch holds samples of ONE
+    frame count and all ranks process the SAME frame count in a given step (one global batch of world x batch_size samples is cut per step and
+    sliced per rank), so tensors stack and the per-step cost is uniform across ranks. Per epoch: each bucket is shuffled with seed+epoch and cut into
+    global batches (its incomplete tail is dropped), then the step order over all buckets is shuffled with the same generator. Same interface as
+    ShardedBatchSampler (set_epoch / persistent skip / epoch_batches for the data-position self-check / __len__ identical on every rank)."""
+
+    def __init__(self, num_samples, batch_size, num_replicas, rank, seed, buckets):
+        assert len(buckets) == num_samples, (len(buckets), num_samples)
+        self.num_samples, self.batch_size = num_samples, batch_size
+        self.num_replicas, self.rank, self.seed = num_replicas, rank, seed
+        self.epoch, self.skip = 0, 0
+        self.bucket_values = sorted(set(int(b) for b in buckets))
+        import numpy as _np
+        _arr = _np.asarray(buckets)
+        self._by_bucket = {b: torch.from_numpy(_np.flatnonzero(_arr == b)) for b in self.bucket_values}
+        gb = self.batch_size * self.num_replicas
+        self.steps_per_bucket = {b: int(len(v)) // gb for b, v in self._by_bucket.items()}
+        self._len = sum(self.steps_per_bucket.values())
+        self._cache_epoch, self._cache = None, None
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        return self._len
+
+    def epoch_global(self):
+        """[(bucket, LongTensor[world x batch_size])] per step of the current epoch (deterministic in seed + epoch, identical on every rank)."""
+        if self._cache_epoch == self.epoch:
+            return self._cache
+        generator = torch.Generator().manual_seed(self.seed * 100003 + self.epoch)
+        gb = self.batch_size * self.num_replicas
+        steps = []
+        for b in self.bucket_values:                                   # fixed bucket order, then one shared permutation of the steps
+            idx = self._by_bucket[b]
+            perm = idx[torch.randperm(len(idx), generator=generator)]
+            steps += [(b, perm[i * gb:(i + 1) * gb]) for i in range(self.steps_per_bucket[b])]
+        order = torch.randperm(len(steps), generator=generator).tolist()
+        self._cache_epoch, self._cache = self.epoch, [steps[i] for i in order]
+        return self._cache
+
+    def epoch_batches(self):
+        """This rank's batches of the current epoch (index = step within the epoch), each a list of dataset indices of one frame count."""
+        r0 = self.rank * self.batch_size
+        return [g[r0:r0 + self.batch_size].tolist() for _, g in self.epoch_global()]
+
+    def epoch_buckets(self):
+        return [b for b, _ in self.epoch_global()]
+
+    def __iter__(self):
+        return iter(self.epoch_batches()[self.skip:])
 
 
 class IndexTaggedDataset(torch.utils.data.Dataset):
@@ -903,7 +970,9 @@ def save_ds_state(accelerator, step, args):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         with open(os.path.join(out_dir, "step.json"), "w") as f:
-            json.dump({"step": step}, f)
+            json.dump({"step": step, "batch_size": int(args.batch_size), "world": int(accelerator.num_processes),
+                       "global_batch": int(args.batch_size) * int(accelerator.num_processes),
+                       "gradient_accumulation_steps": int(args.gradient_accumulation_steps)}, f)
         ckpt_root = os.path.join(args.output_dir, "ckpt")
         for name in os.listdir(ckpt_root):
             m = re.fullmatch(r"ds_state_step-(\d+)", name)
@@ -1051,6 +1120,10 @@ def main(argv=None):
                 print(f"{TAG} Warning: deepspeed.utils.set_z3_leaf_modules unavailable ({e}); MoE modules keep per-submodule ZeRO-3 hooks", flush=True)
     dit, opt = accelerator.prepare(dit, opt)                     # DeepSpeed takes over here: weights / grads / optimizer states sharded over 24 GPUs
     inner = accelerator.unwrap_model(dit)
+    accum = max(1, int(args.gradient_accumulation_steps))
+    if hasattr(dit, "gradient_accumulation_steps"):
+        assert int(dit.gradient_accumulation_steps()) == accum, \
+            f"DeepSpeed config gradient_accumulation_steps={dit.gradient_accumulation_steps()} != --gradient_accumulation_steps {accum} (engine.backward divides the loss by the config value)"
     check_zero3_gather(inner, rank, world, device)
     # MLLM: build → move to GPU → scan weights → self-test output finiteness with a fixed instruction + blank frames. One rank once passed the weight scan but produced nan
     # (the other 23 ranks were fine on the same input), i.e. a one-off bad state of that process, so the whole MLLM is rebuilt and retried, up to 3 times.
@@ -1138,7 +1211,14 @@ def main(argv=None):
     gc.collect()
     gc.freeze()
     for name, dataset, stats, epochs in built:
-        sampler = ShardedBatchSampler(len(dataset), args.batch_size, world, rank, args.seed)
+        _buckets = dataset.frame_buckets()                                 # per-sample frame counts (num_frames_bucket records), one value = old behaviour
+        if len(set(_buckets)) > 1:
+            sampler = BucketedShardedBatchSampler(len(dataset), args.batch_size, world, rank, args.seed, _buckets)
+            if is_main:
+                _bcount = {b: int(len(sampler._by_bucket[b])) for b in sampler.bucket_values}
+                print(f"{TAG} stage {name}: frame buckets {_bcount} samples -> steps/epoch per bucket {sampler.steps_per_bucket} (batches homogeneous in frame count)", flush=True)
+        else:
+            sampler = ShardedBatchSampler(len(dataset), args.batch_size, world, rank, args.seed)
         loader = DataLoader(IndexTaggedDataset(dataset), batch_sampler=sampler, num_workers=args.dataset_num_workers,
                             prefetch_factor=args.dataloader_prefetch_factor or None, collate_fn=lambda b: b,
                             persistent_workers=bool(args.dataset_num_workers))
@@ -1160,7 +1240,8 @@ def main(argv=None):
 
     if is_main:
         os.makedirs(os.path.join(args.output_dir, "ckpt"), exist_ok=True)
-        print(f"{TAG} start: world={world} batch={args.batch_size}(effective {world * args.batch_size}) steps={max_steps} "
+        print(f"{TAG} start: world={world} batch={args.batch_size}(effective {world * args.batch_size}"
+              f"{f' per step x accumulation {accum} = {world * args.batch_size * accum} per optimizer update' if accum > 1 else ''}) steps={max_steps} "
               f"moe_layers={args.moe_layers} experts={args.moe_num_experts} top_k={args.moe_top_k} aux={args.moe_aux_loss_alpha} "
               f"lr base={args.learning_rate} experts={args.new_layers_lr}→{args.learning_rate} gate={args.gate_lr}→{args.gate_lr_end}(linear over the first {args.new_layers_lr_steps} steps) "
               f"text_drop={args.text_drop_prob} motion={args.motion_sub_loss_ratio} "
@@ -1188,7 +1269,7 @@ def main(argv=None):
     per_moe = len(moe_ffns) * num_experts
     cache_off = NUM_LOSS_SLOTS + 2 * per_moe                                  # cache counter slots start here (appended at the end; NUM_LOSS_SLOTS and the MoE offsets are unchanged)
     stat = torch.zeros(cache_off + len(CACHE_STAT_NAMES), device=device)
-    cache_expect = {"latent": None, "ctx": None}                              # latent shape / ctx dim recorded at the first VAE / MLLM encode of this run; cache hits must match
+    cache_expect = {"latent": {}, "ctx": None}                              # latent shape / ctx dim recorded at the first VAE / MLLM encode of this run; cache hits must match
     # "category × expert" selection counts (summed over all MoE layers): [kind=2 (attn, ffn), category, expert]; every 10 steps reduced and row-normalized to P(expert i selected | sample category c)
     moe_kinds = [("attn", moe_attns), ("ffn", moe_ffns)]
     cat_stat = torch.zeros(len(moe_kinds), len(CATEGORIES), num_experts, device=device)
@@ -1196,6 +1277,7 @@ def main(argv=None):
     skipped_steps = 0                   # steps skipped due to bad samples / non-finite loss (not counted in step)
     consecutive_bad = 0                 # consecutive steps with non-finite loss on this rank; 5 in a row means this process's weights are bad, exit for inspection
     step, t0 = step0, time.time()
+    frames_sum, frames_n = 0.0, 0                                        # mean frame count of the steps in the logging window
     dit.train()
 
     while step < max_steps:
@@ -1221,6 +1303,13 @@ def main(argv=None):
                 if is_main:
                     print(f"{TAG} data-position self-check OK: stage {stage['name']} epoch {stage['sampler'].epoch} first batch = batch {check_pos} of this epoch (sample indices {expect[:3]}...)", flush=True)
                 check_pos = None
+            # ---- homogeneous frame count guard (defence in depth): the sampler cuts batches per frame bucket and the dataset replaces failed samples within the
+            #      same bucket; should a sample with another frame count still appear, drop it instead of crashing in the stack (seen 10/21-10/23 before the dataset fix)
+            if batch and len({int(s_.get("num_frames_eff") or 0) for s_ in batch}) > 1:
+                _nf_major = max({int(s_.get("num_frames_eff") or 0) for s_ in batch}, key=lambda v: sum(1 for s_ in batch if int(s_.get("num_frames_eff") or 0) == v))
+                _odd = [s_ for s_ in batch if int(s_.get("num_frames_eff") or 0) != _nf_major]
+                print(f"{TAG} rank{rank}: dropping {len(_odd)} sample(s) whose frame count differs from the batch ({_nf_major}): {[s_.get('src_video_path') for s_ in _odd]}", flush=True)
+                batch = [s_ for s_ in batch if int(s_.get("num_frames_eff") or 0) == _nf_major]
             # ---- 0. Cache split. Hits (the dataset worker read a cache file, "cache" key present) have no pixels, only VAE distribution params + both ctx;
             #      payloads[i] = hit tensors / None, pending[i] = miss in a cache group (written after this step) / None; both filtered in sync with guard drops
             batch, payloads, pending, cache_counts = split_batch_for_cache(batch, cache_dir if cache_writer is not None else "", args, cache_expect, rank, step)
@@ -1309,6 +1398,11 @@ def main(argv=None):
                 enqueue_cache_payloads(cache_writer, pending, args, step, rank)
 
             # ---- 4. DiT forward (load-balancing losses are attached to the graph inside the MoE layers), under bf16 autocast
+            # Gradient accumulation: this micro-batch is an update boundary iff the step counter after this batch is a multiple of accum (accum=1: always).
+            # The engine-level override is mirrored into the ZeRO-3 optimizer, which accumulates the partitioned grads across micro-batches and copies them to the
+            # fp32 optimizer grads only on the boundary; engine.backward divides the loss by accum. Skipped batches (guards) do not advance step, so all ranks stay in lockstep.
+            is_boundary = ((step + 1) % accum == 0)
+            dit.set_gradient_accumulation_boundary(is_boundary=is_boundary)
             t_mark = sync_time()
             patch = inner.patch_size
             f_lat, h_lat, w_lat = latents.shape[2:]
@@ -1348,11 +1442,16 @@ def main(argv=None):
 
             # ---- 6. backward + update (accelerate's DeepSpeed wrapper also steps inside backward; clipping is in the ds config)
             lr_new, lr_gate = set_learning_rates(opt, step, args)   # this step's learning rates (routed experts / gates transition linearly with step, the rest constant)
-            accelerator.backward(loss)
-            opt.step()
-            opt.zero_grad()
+            # equivalent to accelerate's DeepSpeed wrapper (engine.backward + engine.step) but with the engine step only on accumulation boundaries
+            dit.set_gradient_accumulation_boundary(is_boundary=is_boundary)
+            dit.backward(loss)
+            if is_boundary:
+                dit.step()
+                opt.step()
+                opt.zero_grad()
             timing["dit"] += sync_time() - t_mark
             timing["n"] += 1
+            frames_sum += float(batch[0].get("num_frames_eff") or args.num_frames) if batch else 0.0; frames_n += 1
             step += 1
 
             # ---- 7. stats and logging
@@ -1376,6 +1475,9 @@ def main(argv=None):
                 pbar.update(1)
                 pbar.set_postfix(loss=f"{float(loss.detach()):.4f}", aux=f"{float(loss_aux):.4f}", refresh=False)
             if step % 10 == 0:
+                mem = accelerator.reduce(torch.tensor([torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)],
+                                                      device=device, dtype=torch.float64), reduction="max").tolist()   # peak over the window, max over ranks
+                torch.cuda.reset_peak_memory_stats(device)
                 totals = accelerator.reduce(stat.clone(), reduction="sum").tolist()
                 cat_totals = accelerator.reduce(cat_stat.clone(), reduction="sum")            # [kind, category, expert]
                 if is_main:
@@ -1384,7 +1486,8 @@ def main(argv=None):
                                "loss/aux_attn": totals[2] / count, "loss/aux_ffn": totals[3] / count, "loss/aux": (totals[2] + totals[3]) / count,
                                "loss/total": totals[4] / count,
                                "lr/base": args.learning_rate, "lr/new_layers": lr_new, "lr/gate": lr_gate,
-                               "skipped_steps": skipped_steps, "stage": stage_index}
+                               "skipped_steps": skipped_steps, "stage": stage_index,
+                               "mem/alloc_max_gb": mem[0] / 2 ** 30, "mem/reserved_max_gb": mem[1] / 2 ** 30, "data/frames_mean": frames_sum / max(frames_n, 1)}
                     # one folder per MoE layer (moe_attn_L{block} / moe_ffn_L{block}) with one curve per expert: fraction of tokens selected
                     summary = {}
                     for kind, offset in (("attn", NUM_LOSS_SLOTS), ("ffn", NUM_LOSS_SLOTS + per_moe)):
@@ -1442,9 +1545,11 @@ def main(argv=None):
                           f"ffn sel {summary['ffn'][0]:.2f}~{summary['ffn'][1]:.2f} per-expert {'/'.join(f'{v:.2f}' for v in summary['ffn'][2])} "
                           f"{rate:.1f}rec/s eta={(max_steps - step) / max(rate, 1e-6) * world * args.batch_size / 3600:.1f}h "
                           f"t(vae/mllm/dit)={timing['vae'] / max(timing['n'], 1):.1f}/{timing['mllm'] / max(timing['n'], 1):.1f}/{timing['dit'] / max(timing['n'], 1):.1f}s "
+                          f"mem={mem[0] / 2 ** 30:.1f}/{mem[1] / 2 ** 30:.1f}GiB frames={frames_sum / max(frames_n, 1):.0f} "
                           + " ".join(spread_note) + (" " + cache_note if cache_note else ""), flush=True)
                 stat.zero_()
                 cat_stat.zero_()
+                frames_sum, frames_n = 0.0, 0
                 timing.update(vae=0.0, mllm=0.0, dit=0.0, n=0)
             if step % args.save_steps == 0:
                 save_trainable_weights(accelerator, dit, keys, step, args)
@@ -1466,6 +1571,7 @@ def main(argv=None):
         cache_writer.close()
         accelerator.wait_for_everyone()
         if is_main and not args.cache_delete_on_done:   # no auto-delete at the end; delete manually
+            os.makedirs(os.path.join(args.output_dir, "flags"), exist_ok=True)
             with open(os.path.join(args.output_dir, "flags", "CACHE_KEPT_ASK_USER"), "w") as f:
                 f.write(f"{time.strftime('%F %T')} training finished, cache dir {cache_dir} kept; decide manually whether to delete it\n")
             print(f"{TAG} cache: training finished, cache dir {cache_dir} kept (--cache_delete_on_done 0); decide manually whether to delete it", flush=True)

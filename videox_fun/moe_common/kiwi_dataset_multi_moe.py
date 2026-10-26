@@ -181,8 +181,10 @@ class KiwiMultiEditDataset(KiwiEditDataset):
                 minfo["cache_group"] = cg
             self._joined2multi[tagged] = (plist, r.get("turn_types"),
                                           r.get("turn_types_qwen"), minfo)
-            shadow.append({"src_video": r["src_video"], "tgt_video": r["tgt_video"],
-                           "prompt": tagged})
+            srow = {"src_video": r["src_video"], "tgt_video": r["tgt_video"], "prompt": tagged}
+            if r.get("num_frames_bucket"):                                  # per-sample frame count (frame census), read by the parent __getitem__ and the cache key
+                srow["num_frames_bucket"] = int(r["num_frames_bucket"])
+            shadow.append(srow)
         # Write the shadow metadata to a temp file for the parent (the parent only takes a path and reads it once in __init__).
         # Unlink right after reading: "keep until process exit" effectively meant never deleting, and temp files piled up to hundreds of GB;
         # with the videoeditor-56b mixed dataset (4.54M records) each rank's shadow is ~2.6 GB, so 24 ranks leak ~21 GB per node per launch.
@@ -328,7 +330,7 @@ class KiwiMultiEditDataset(KiwiEditDataset):
         if self.mask_loss and minfo["mode"] != "global":
             return None
         key = self.cache_key_of(row["src_video"], row["tgt_video"], plist[0],
-                                self.num_frames, self.height, self.width)
+                                self.frames_of_row(row), self.height, self.width)   # per-sample frame count: a 121-frame and an 81-frame entry never collide
         return key, self.cache_path_of(key), cg
 
     def _cache_validate(self, obj, key):
@@ -402,6 +404,7 @@ class KiwiMultiEditDataset(KiwiEditDataset):
             "loss_mask": None,
             "src_video_path": row["src_video"],
             "tgt_video_path": row["tgt_video"],
+            "num_frames_eff": self.frames_of_row(row),
             "src_video": None, "tgt_video": None, "ref_image": None,
             "src_pixels": None, "tgt_pixels": None,       # no pixels: the main process pixels_of / rebuild_src_frames / encode_batch must not touch it
             "cache": cache,                               # {src_mean, src_logvar, tgt_mean, tgt_logvar, ctx_cond, ctx_null} bf16 CPU

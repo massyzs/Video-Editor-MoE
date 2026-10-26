@@ -242,6 +242,9 @@ def build_mllm(args, dit_dim=3072):
     """Qwen2.5-VL + connector; loads connector / query from moe_expert_init.safetensors. Returns the module on CPU (frozen, eval)."""
     from safetensors.torch import load_file
     from videox_fun.moe_common.mllm_encoder_moe import MLLMInContext, MLLMInContextConfig
+    impl = getattr(args, "mllm_attn_impl", "sdpa")
+    if impl and impl != "auto":
+        os.environ["MLLM_ATTN_IMPL"] = impl        # the backend must be set at construction (set_attn_implementation is a silent no-op on the kiwi copy of Qwen)
     with no_zero3_init():
         mllm = MLLMInContext(MLLMInContextConfig(
             mllm_id=args.mllm_model, num_image_queries=256, num_video_queries=512, num_ref_queries=768,
@@ -251,6 +254,14 @@ def build_mllm(args, dit_dim=3072):
     init_state = load_file(args.init_weights)
     mllm.load_state_dict({key[len("mllm."):]: value for key, value in init_state.items() if key.startswith("mllm.")}, strict=False)
     mllm.eval().requires_grad_(False)
+    # The Qwen backbone defaults to flash_attention_2, which gave random NaNs in ~3-5% of calls in our setup (same weights and inputs; SDPA is fine).
+    # The MLLM is a frozen encoder, so switching backend only changes bf16 rounding; default sdpa, pass "auto" to keep the original behaviour.
+    if impl and impl != "auto":
+        got = getattr(mllm.mllm_backbone.config, "_attn_implementation", None)
+        assert got == impl, f"MLLM attention backend should be {impl}, got {got} (env var MLLM_ATTN_IMPL not picked up by mllm_encoder_moe?)"
+    # Non-persistent buffers are not in the state_dict, so weight scans miss them; assert here that every RoPE inv_freq was recomputed correctly (see mllm_encoder_moe)
+    bad = [n for n, b in mllm.named_buffers() if n.endswith("inv_freq") and (not torch.isfinite(b).all() or float(b.abs().max()) > 1.0 + 1e-6)]
+    assert not bad, f"MLLM RoPE inv_freq still holds garbage values: {bad}"
     return mllm
 
 
