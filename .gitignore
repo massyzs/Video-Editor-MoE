@@ -36,3 +36,7 @@ nohup.out
 
 # local, cluster-specific launcher copies
 *.local.sh
+
+# local backup copies and scratch files
+*.bak_*
+*.orig
