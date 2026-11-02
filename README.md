@@ -12,11 +12,10 @@ training and inference code for four models:
 | **mlp-moe** | [`scripts/moe/mlp-moe`](scripts/moe/mlp-moe) | FFN of 14 DiT blocks replaced by a 12-expert top-3 MoE, trained end to end | 18.6B | [Massyzs/mlp-moe](https://huggingface.co/Massyzs/mlp-moe) |
 | **videoeditor-14b** | [`scripts/moe/videoeditor-14b`](scripts/moe/videoeditor-14b) | FFN **and** self-attention key/value of 14 blocks as 7-expert top-3 MoEs | 14.0B (~8B active) | [Massyzs/videoeditor-14b](https://huggingface.co/Massyzs/videoeditor-14b) |
 | **videoeditor-56b** | [`scripts/moe/videoeditor-56b`](scripts/moe/videoeditor-56b) | videoeditor-14b scaled to 35 experts per MoE layer (7 sources x 5 noised copies) | 55.9B (~8B active) | [Massyzs/videoeditor-56b](https://huggingface.co/Massyzs/videoeditor-56b) |
+| **videoeditor-14b-long** | [`scripts/moe/videoeditor-14b`](scripts/moe/videoeditor-14b) | videoeditor-14b continued on the same data re-cut to 121 / 81 frames per sample (half an epoch) | 14.0B (~8B active) | [Massyzs/videoeditor-14b-long](https://huggingface.co/Massyzs/videoeditor-14b-long) |
+| **videoeditor-56b-long** | [`scripts/moe/videoeditor-56b`](scripts/moe/videoeditor-56b) | videoeditor-56b continued on the same data re-cut to 121 / 81 frames per sample | 55.9B (~8B active) | [Massyzs/videoeditor-56b-long](https://huggingface.co/Massyzs/videoeditor-56b-long) |
 
-**Long-video variants.** videoeditor-14b and videoeditor-56b were additionally trained on the same data re-cut to **121 or 81 frames per sample**
-(the frame count is chosen per video; batches are homogeneous in frame count). Their weights are released separately:
-[Massyzs/videoeditor-14b-long](https://huggingface.co/Massyzs/videoeditor-14b-long) and
-[Massyzs/videoeditor-56b-long](https://huggingface.co/Massyzs/videoeditor-56b-long); run inference with `--num_frames 121` (or 81).
+The two `-long` variants use the same code and inference scripts as their base models; pass `--num_frames 121` (or 81) for long inputs.
 
 The frozen components shared by all models (DiT base, MLLM encoder, query tokens/connector, VAE) are in
 [Massyzs/kiwi-edit-5b-instruct-only-videoxfun](https://huggingface.co/Massyzs/kiwi-edit-5b-instruct-only-videoxfun).
@@ -42,7 +41,14 @@ huggingface-cli download Massyzs/kiwi-edit-5b-instruct-only-videoxfun \
     --local-dir $BASE_DIR/ckpt/kiwi-edit-instruct-only-videoxfun
 ```
 
-Each model repository ships its weights as a tar.gz stream split into 20 GB chunks (optimizer state is not included):
+Each model repository ships its weights as a tar.gz stream split into 20 GB chunks (optimizer state is not included). After extraction the layout under `BASE_DIR` is:
+
+```
+$BASE_DIR/ckpt/kiwi-edit-instruct-only-videoxfun/   shared base components (DiT base, VAE, qwen/ MLLM encoder, moe_expert_init.safetensors)
+$BASE_DIR/ckpt/<model>/                              one folder per downloaded model, e.g. videoeditor-14b/, videoeditor-14b-long/, explicit-moe/
+```
+
+For example, videoeditor-14b (replace the name for any other model, e.g. `videoeditor-14b-long`):
 
 ```bash
 huggingface-cli download Massyzs/videoeditor-14b --local-dir $BASE_DIR/hf/videoeditor-14b
@@ -53,7 +59,9 @@ cp SHA256SUMS.contents $BASE_DIR/ckpt/ && (cd $BASE_DIR/ckpt && sha256sum -c SHA
 
 ## Inference
 
-Every model can edit a single video (49 frames at 480x832 by default) from an instruction:
+Every model edits one source video from a text instruction. Inputs: `--src_video` is any mp4 (the first frames are used, resized/cropped to
+480x832; 49 frames by default, `--num_frames 121` or `81` for the `-long` models), `--prompt` is the instruction (or `--prompts "step 1 ||| step 2"`
+for a multi-step edit). Outputs go to `--out_dir`: `<name>.mp4` (16 fps) and lossless PNG frames in `frames/<name>/`. Run from the repository root:
 
 ```bash
 python scripts/moe/videoeditor-14b/moe_v3_1_infer.py \
@@ -69,6 +77,8 @@ python scripts/moe/videoeditor-14b/moe_v3_1_infer.py \
 | mlp-moe | `scripts/moe/mlp-moe/moe_v3_infer.py` | 1 x 80 GB |
 | videoeditor-14b | `scripts/moe/videoeditor-14b/moe_v3_1_infer.py` | 1 x 80 GB |
 | videoeditor-56b | `scripts/moe/videoeditor-56b/moe_v3_2_infer.py --gpus 2` | 2 x 80 GB (the DiT is split across both) |
+| videoeditor-14b-long | `scripts/moe/videoeditor-14b/moe_v3_1_infer.py --num_frames 121` | 1 x 80 GB |
+| videoeditor-56b-long | `scripts/moe/videoeditor-56b/moe_v3_2_infer.py --gpus 2 --num_frames 121` | 2 x 80 GB |
 
 Defaults: 50 sampling steps, sigma shift 5, text classifier-free guidance with scale 3 (applied on the first 60% of the steps for
 mlp-moe / videoeditor-14b / videoeditor-56b, on all steps for explicit-moe). The output is `<out_dir>/<name>.mp4` plus lossless
