@@ -13,7 +13,12 @@ training and inference code for four models:
 | **videoeditor-14b** | [`scripts/moe/videoeditor-14b`](scripts/moe/videoeditor-14b) | FFN **and** self-attention key/value of 14 blocks as 7-expert top-3 MoEs | 14.0B (~8B active) | [Massyzs/videoeditor-14b](https://huggingface.co/Massyzs/videoeditor-14b) |
 | **videoeditor-56b** | [`scripts/moe/videoeditor-56b`](scripts/moe/videoeditor-56b) | videoeditor-14b scaled to 35 experts per MoE layer (7 sources x 5 noised copies) | 55.9B (~8B active) | [Massyzs/videoeditor-56b](https://huggingface.co/Massyzs/videoeditor-56b) |
 
-The frozen components shared by all four (DiT base, MLLM encoder, query tokens/connector, VAE) are in
+**Long-video variants.** videoeditor-14b and videoeditor-56b were additionally trained on the same data re-cut to **121 or 81 frames per sample**
+(the frame count is chosen per video; batches are homogeneous in frame count). Their weights are released separately:
+[Massyzs/videoeditor-14b-long](https://huggingface.co/Massyzs/videoeditor-14b-long) and
+[Massyzs/videoeditor-56b-long](https://huggingface.co/Massyzs/videoeditor-56b-long); run inference with `--num_frames 121` (or 81).
+
+The frozen components shared by all models (DiT base, MLLM encoder, query tokens/connector, VAE) are in
 [Massyzs/kiwi-edit-5b-instruct-only-videoxfun](https://huggingface.co/Massyzs/kiwi-edit-5b-instruct-only-videoxfun).
 All weight repositories are gated: request access on the model page.
 
@@ -86,6 +91,9 @@ bash scripts/moe/videoeditor-14b/train_multinode.sh 0     # on node 0; use 1, 2,
 | mlp-moe | 3 nodes x 8 GPUs, batch 192, DeepSpeed ZeRO-3 | merged expert init built by `merge_experts.py` |
 | videoeditor-14b | 3 nodes x 8 GPUs, batch 192, DeepSpeed ZeRO-3 | merged expert init built by `merge_experts_v3_1.py` |
 | videoeditor-56b | 3 nodes x 8 GPUs, batch 120, DeepSpeed ZeRO-3 with CPU-offloaded optimizer | the videoeditor-14b expert init, 5 noised copies per expert |
+
+Long-video training: dataset records may carry `num_frames_bucket` (121 or 81); set `NUM_FRAMES=121` in the launcher and the trainer builds
+frame-count-homogeneous batches (see `docs/DATA.md`). The released long-video weights continue from the released checkpoints with the same launchers.
 
 The merged expert initialisations combine the category LoRA experts (released with explicit-moe) with a direct full fine-tune
 of Kiwi-Edit that is not released; the model READMEs explain how to fine-tune from the released checkpoints instead.

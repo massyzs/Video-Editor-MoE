@@ -320,3 +320,8 @@ for i in range(len(ds)):
 
 Every line should show `(3, 49, 480, 832)` twice. If a record fails to load, a `sample load failed` warning appears on
 stderr, and the printed `src_video_path` belongs to the random replacement record rather than the requested one.
+
+## Long-video records
+
+A record may carry `num_frames_bucket` (121 or 81). The datasets then load that many frames for the sample and the trainer groups
+samples so that every batch has one frame count; records without the field use the launcher's `NUM_FRAMES`.
