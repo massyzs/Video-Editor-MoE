@@ -53,6 +53,7 @@ Changes relative to `videox_fun/models/wan_transformer3d_kiwi.py` are marked `MO
 | `moe_v3_2_ep.py` | optional expert parallelism (`--ep 1`): expert placement, expert weight store with sharded CPU Adam, EP versions of the MoE modules |
 | `merge_ep_ckpt.py` | merges an expert-parallel checkpoint into the full `moe_v3_2_trainable.safetensors` |
 | `moe_v3_2_infer.py` | inference on two GPUs, for a single video or for benchmark case lists (several CFG / sigma-shift variants per model load); `--low_mem 1` runs it on one GPU (see [Low-memory mode](#low-memory-mode-one-gpu)) |
+| `infer.sh`, `infer_lowmem.sh`, `infer_fast.sh` | Launchers for the three inference modes (default on two 80 GB GPUs, low memory on one 80 GB or 40 GB GPU, fast on two GPUs): edit the configuration block at the top and run |
 | `moe_v3_2_infer_fast.py`, `moe_v3_2_model_fast.py`, `wan_transformer3d_kiwi_moe_v3_2_fast.py` | fast-inference copies of the three files above (same weights; fused expert path, grouped GEMMs, stream-pipelined CFG; see [Fast inference](#fast-inference-two-gpus)) |
 | `train_multinode.sh` | training launcher for 3 nodes x 8 GPUs |
 | `train_smoke.sh` | 24-GPU smoke test: 30 steps, no checkpoints, no wandb |
@@ -99,7 +100,9 @@ first. `--gpus 1` is accepted only when the whole bf16 DiT fits in 92% of one GP
 The model is built without random initialisation (`--fast_init 1`). The script asserts that the checkpoint covers every
 parameter, then loads it. `--experts_merged` stays empty, because inference needs only the released files.
 
-Run the commands from the repository root.
+The simplest way is one of the launchers `infer.sh` (two GPUs) / `infer_lowmem.sh` (one GPU) / `infer_fast.sh` (two GPUs, faster): edit the
+configuration block at the top (weights, input video, instruction, output directory, GPU ids) and run `bash scripts/moe/videoeditor-56b/infer.sh`.
+The equivalent commands, run from the repository root:
 
 ### A single video
 

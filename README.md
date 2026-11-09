@@ -1,6 +1,33 @@
 # Video-Editor-MoE
 
-Instruction-based video editing with mixture-of-experts diffusion transformers.
+<p align="center">
+  <img src="assets/tencent_video.png" alt="Tencent Video" height="56">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="assets/nus.png" alt="National University of Singapore" height="72">
+</p>
+
+<p align="center">
+  <a href="https://arxiv.org/abs/2611.03043"><img src="https://img.shields.io/badge/arXiv-2611.03043-b31b1b.svg" alt="arXiv"></a>&nbsp;
+  <a href="https://arxiv.org/html/2611.03043"><img src="https://img.shields.io/badge/Paper-HTML-blue.svg" alt="Paper (HTML)"></a>&nbsp;
+  <a href="https://huggingface.co/Massyzs"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Weights-yellow.svg" alt="Weights"></a>
+</p>
+
+**Video-Editor-MoE** is a mixture-of-experts video editing model developed by Tencent (Tencent Video) and the National University of
+Singapore. It edits videos from text instructions, including complex multi-step instructions (several edits of different kinds in one
+sentence), by adding experts to a video diffusion transformer that specialise in different kinds of edits. Paper:
+[VideoEditor-MoE: Scaling Complex Video Editing with Mixture of Experts](https://arxiv.org/abs/2611.03043) ([HTML](https://arxiv.org/html/2611.03043)).
+
+We release all parameters of every model (the 14B and 56B editors and the two baselines), the long-video versions (121 / 81 frames),
+fast-inference scripts for two GPUs and low-GPU-memory scripts that run the 14B model on a 40 GB GPU and the 56B model on a single GPU,
+together with the training code. See [Inference](#inference) for the ready-made launchers.
+
+## Visual comparison
+
+Multi-step editing instructions on the benchmark videos: source video, CoinVE-Edit, MiniMax-H3, Kiwi-Edit (base), Explicit-MoE, MLP-MoE,
+Ours 14B-A8B and Ours 56B-A8B (one frame per clip; [PDF version](assets/visual_comparison.pdf)).
+
+<p align="center"><img src="assets/visual_comparison.png" alt="Visual comparison of multi-step video edits" width="100%"></p>
+
+## Models
 
 All models start from **[Kiwi-Edit](https://github.com/showlab/Kiwi-Edit)** (5B, instruct-only; a Wan2.2-TI2V-5B video DiT conditioned
 on a Qwen2.5-VL-based MLLM encoder) and add experts that specialise the DiT for different kinds of edits. This repository contains the
@@ -59,7 +86,32 @@ cp SHA256SUMS.contents $BASE_DIR/ckpt/ && (cd $BASE_DIR/ckpt && sha256sum -c SHA
 
 ## Inference
 
-Every model edits one source video from a text instruction. Inputs: `--src_video` is any mp4 (the first frames are used, resized/cropped to
+### Quick start: launcher scripts
+
+videoeditor-14b and videoeditor-56b ship three ready-made launchers each. Open the script, edit the configuration block at the top
+(`BASE_DIR`, `CKPT`, `SRC_VIDEO`, `PROMPT` or `PROMPTS`, `NAME`, `OUT_DIR`, GPU ids), then run it from anywhere:
+
+```bash
+bash scripts/moe/videoeditor-14b/infer.sh            # default: one 80 GB GPU
+bash scripts/moe/videoeditor-14b/infer_lowmem.sh     # low memory: one 40 GB GPU, same speed
+bash scripts/moe/videoeditor-14b/infer_fast.sh       # fast: two 80 GB GPUs
+bash scripts/moe/videoeditor-56b/infer.sh            # default: two 80 GB GPUs
+bash scripts/moe/videoeditor-56b/infer_lowmem.sh     # low memory: one 80 GB or one 40 GB GPU
+bash scripts/moe/videoeditor-56b/infer_fast.sh       # fast: two 80 GB GPUs
+```
+
+| script | what it runs | GPUs | time per 49-frame video (H100) | host RAM |
+|---|---|---|---|---|
+| `videoeditor-14b/infer.sh` | `moe_v3_1_infer.py` | 1 x 80 GB | 35 s | 30 GB |
+| `videoeditor-14b/infer_lowmem.sh` | `moe_v3_1_infer.py --low_mem 1 --reserve_gib 10` | 1 x 40 GB (peak 35 GiB) | 35 s | 45 GB |
+| `videoeditor-14b/infer_fast.sh` | `moe_v3_1_infer_fast.py --moe_impl grouped --dp_cfg 1 --cuda_graph 1` | 2 x 80 GB | 30 s | 30 GB |
+| `videoeditor-56b/infer.sh` | `moe_v3_2_infer.py --gpus 2` | 2 x 80 GB | 46 s | 120 GB while loading |
+| `videoeditor-56b/infer_lowmem.sh` | `moe_v3_2_infer.py --gpus 1 --low_mem 1` | 1 x 80 GB (peak 71 GiB) / 1 x 40 GB (peak 28 GiB) | 6 min / 10 min | 75 GB / 125 GB |
+| `videoeditor-56b/infer_fast.sh` | `moe_v3_2_infer_fast.py --gpus 2 --moe_impl grouped` | 2 x 80 GB | 37 s | 120 GB while loading |
+
+All six produce the same edit for the same weights, seed and settings (the fast scripts up to bf16 rounding, the low-memory mode up to the
+pipeline's run-to-run GPU variation). `EXTRA_ARGS` in the configuration block passes any further option of the python script (sampling steps,
+seed, CFG scale, ...); the sections below and the per-model READMEs describe them. Every model edits one source video from a text instruction. Inputs: `--src_video` is any mp4 (the first frames are used, resized/cropped to
 480x832; 49 frames by default, `--num_frames 121` or `81` for the `-long` models), `--prompt` is the instruction (or `--prompts "step 1 ||| step 2"`
 for a multi-step edit). Outputs go to `--out_dir`: `<name>.mp4` (16 fps) and lossless PNG frames in `frames/<name>/`. Run from the repository root:
 

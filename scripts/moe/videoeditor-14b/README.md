@@ -132,6 +132,7 @@ therefore also carries the balance gradient to the routers. The released model u
 | `wan_transformer3d_kiwi_moe_v3_1.py` | The DiT: a self-contained copy of `videox_fun/models/wan_transformer3d_kiwi.py`. Additions are marked `MOE-V3.1`: `Fp32Gate`, `route_tokens`, `dispatch_by_expert`, `expert_balance_loss`, `AddAuxiliaryLoss`, `MoEFFN`, `MoEKVSelfAttention`, `attention_with_scale`, the block- and model-level `moe` arguments and `moe_attns()` / `moe_ffns()`. The environment variable `MOE_ATTN_BACKEND` (`fa2` default, `fa3`, `cudnn`, `auto`) selects the attention kernel |
 | `moe_v3_1_model.py` | Assembly: `EXPERT_NAMES`, `build_dit` (builds the MoE DiT and optionally loads the merged expert initialisation), `mark_trainable` (three learning-rate groups: base / experts / routers), `TextEncoder` (MLLM), `build_mllm`, `build_vae`, `load_trainable_weights` |
 | `moe_v3_1_infer.py` | Inference on one video or on a case list, with text CFG and optional per-token expert maps; `--low_mem 1` for 40 GB GPUs (see [Low-memory mode](#low-memory-mode-40-gb-gpus)) |
+| `infer.sh`, `infer_lowmem.sh`, `infer_fast.sh` | Launchers for the three inference modes (default on one 80 GB GPU, low memory on one 40 GB GPU, fast on two GPUs): edit the configuration block at the top and run |
 | `moe_v3_1_infer_fast.py`, `moe_v3_1_model_fast.py`, `wan_transformer3d_kiwi_moe_v3_1_fast.py` | Fast-inference copies of the three files above (same weights; fused expert path, grouped GEMMs, second-GPU CFG replica, CUDA graphs; see [Fast inference](#fast-inference-two-gpus)) |
 | `moe_v3_1_train.py` | Training loop: DeepSpeed ZeRO-3, full DiT, flow-matching loss, checkpoint and resume |
 | `merge_experts_v3_1.py` | One-off: builds the initial weights of experts 1-6 (`experts_v3_1.safetensors`) from the LoRA experts and the direct fine-tune |
@@ -175,8 +176,9 @@ optimizer state.
 
 ## Inference
 
-Inference runs on one 80 GB GPU (one 40 GB GPU with `--low_mem 1`, see [Low-memory mode](#low-memory-mode-40-gb-gpus)). Run the commands from
-the repository root:
+Inference runs on one 80 GB GPU (one 40 GB GPU with `--low_mem 1`, see [Low-memory mode](#low-memory-mode-40-gb-gpus)). The simplest way is
+one of the launchers `infer.sh` / `infer_lowmem.sh` / `infer_fast.sh`: edit the configuration block at the top (weights, input video, instruction,
+output directory, GPU ids) and run `bash scripts/moe/videoeditor-14b/infer.sh`. The equivalent commands, run from the repository root:
 
 ```bash
 # one video, one instruction
