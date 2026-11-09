@@ -52,7 +52,8 @@ Changes relative to `videox_fun/models/wan_transformer3d_kiwi.py` are marked `MO
 | `moe_v3_2_train.py` | training loop: mixed data, flow-matching loss, three learning-rate groups, DeepSpeed ZeRO-3 saving and resuming, optional expert parallelism |
 | `moe_v3_2_ep.py` | optional expert parallelism (`--ep 1`): expert placement, expert weight store with sharded CPU Adam, EP versions of the MoE modules |
 | `merge_ep_ckpt.py` | merges an expert-parallel checkpoint into the full `moe_v3_2_trainable.safetensors` |
-| `moe_v3_2_infer.py` | inference on two GPUs, for a single video or for benchmark case lists (several CFG / sigma-shift variants per model load) |
+| `moe_v3_2_infer.py` | inference on two GPUs, for a single video or for benchmark case lists (several CFG / sigma-shift variants per model load); `--low_mem 1` runs it on one GPU (see [Low-memory mode](#low-memory-mode-one-gpu)) |
+| `moe_v3_2_infer_fast.py`, `moe_v3_2_model_fast.py`, `wan_transformer3d_kiwi_moe_v3_2_fast.py` | fast-inference copies of the three files above (same weights; fused expert path, grouped GEMMs, stream-pipelined CFG; see [Fast inference](#fast-inference-two-gpus)) |
 | `train_multinode.sh` | training launcher for 3 nodes x 8 GPUs |
 | `train_smoke.sh` | 24-GPU smoke test: 30 steps, no checkpoints, no wandb |
 | `probe_moe_v3_2_cpu.py`, `test_ep_cpu.py`, `test_mllm_pre_cpu.py`, `check_build_v3_2.py` | CPU tests (see [Tests](#tests)) |
@@ -87,7 +88,8 @@ from the package.
 Requirements:
 
 - Two GPUs with at least 60 GiB free each. The script checks this at start (`--min_free_gib`). The bf16 DiT is 112 GB and does
-  not fit one 80 GB GPU.
+  not fit one 80 GB GPU; `--gpus 1 --low_mem 1` runs it on one GPU anyway by streaming MoE blocks from host memory (see
+  [Low-memory mode](#low-memory-mode-one-gpu)).
 - About 120-210 GB of free host RAM. The bf16 DiT is first built on the CPU, then the checkpoint is streamed into it, and only
   then does the model move to the GPUs.
 
@@ -162,6 +164,58 @@ Exit codes for a retrying runner: 17 = non-finite weights after loading, 18 = th
 
 Install flash-attn (see `requirements.txt`) for the DiT attention. `MOE_ATTN_BACKEND=fa3` switches the DiT to
 FlashAttention-3. The MLLM encoder uses PyTorch SDPA.
+
+### Low-memory mode (one GPU)
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/moe/videoeditor-56b/moe_v3_2_infer.py \
+    --base_dir <BASE_DIR> --ckpt <BASE_DIR>/ckpt/videoeditor-56b --gpus 1 --low_mem 1 \
+    --src_video <input.mp4> --prompt "Remove the dog" --name dog_removed --out_dir <OUT_DIR>
+```
+
+`--low_mem 1` (off by default; the default two-GPU path is unchanged) keeps the MLLM encoder in pinned host memory and copies it to the GPU
+only while a case is encoded. The 16 dense blocks, the embeddings and the head stay on the GPU. Of the 14 MoE blocks (7.1 GiB each), as many as
+fit into (free GPU memory - `--reserve_gib`, default 12 GiB) stay resident; the others live in pinned host memory and are streamed through two
+GPU slots: before a block runs, its weights are copied into a slot, and the next block is prefetched on a side stream while the current one
+computes. All 35 experts of a layer are used in every forward pass, so streaming per block is the right granularity. The results are those of
+the two-GPU run up to the pipeline's run-to-run variation (same kernels on the same data).
+
+| GPU | resident / streamed MoE blocks | peak GPU memory | time per 49-frame video |
+|---|---|---|---|
+| 1 x 80 GB | 6 / 8 (automatic) | 70.8 GiB | 351-356 s (about 6 min) |
+| 1 x 40 GB (`--emulate_gpu_gib 38` on an 80 GB GPU) | 0 / 14 | 28.3 GiB | 600-611 s (about 10 min) |
+| 2 x 80 GB, default mode | - | 58 + 60 GiB | 46 s |
+
+Each streamed block costs 7.1 GiB of host-to-GPU traffic per DiT forward (80 forwards per video), so the time is set by the PCIe bandwidth
+(14 GB/s from pinned memory on our server). Options: `--resident_blocks N` fixes the number of resident MoE blocks; `--numa_bind 1` (default)
+binds the process to the CPUs of the GPU's NUMA node before pinning host memory; `--min_free_gib` defaults to 30 in this mode;
+`--emulate_gpu_gib G` caps the PyTorch allocator at G GiB to test a smaller GPU on a larger one. Host RAM: the bf16 model (112 GB) is
+loaded first; each streamed block then moves into a pinned 8 GiB buffer (the host allocator rounds to powers of two) and the MLLM into
+another 8 GiB: measured resident set 75 GB with 6 resident blocks, 125 GB with all 14 streamed, 105 GB peak while loading. The script
+checks the available host RAM before pinning. Pinning adds a few minutes at start.
+
+### Fast inference (two GPUs)
+
+`moe_v3_2_infer_fast.py` has the same command line as `moe_v3_2_infer.py` (two GPUs, `--gpus 2`) plus `--fuse_experts`, `--fuse_kv`,
+`--moe_impl`, `--cfg_batch` and `--cfg_pipeline`; it builds the DiT from `moe_v3_2_model_fast.py` / `wan_transformer3d_kiwi_moe_v3_2_fast.py`.
+Recommended:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python scripts/moe/videoeditor-56b/moe_v3_2_infer_fast.py --gpus 2 --moe_impl grouped \
+    --base_dir <BASE_DIR> --ckpt <BASE_DIR>/ckpt/videoeditor-56b --src_video <input.mp4> --prompt "Remove the dog" --out_dir <OUT_DIR>
+```
+
+- `--fuse_experts 1` (default): after placement, the expert weights of every MoE module are stacked into one contiguous tensor and the expert
+  parameters become views of it (no extra memory). `--fuse_kv 1` (default): each expert's k and v projections run as one GEMM. Bit-identical.
+- `--moe_impl grouped`: one `torch._grouped_mm` per expert linear over the tokens sorted by expert (PyTorch >= 2.8), no host synchronisation.
+  The bias is added after the bf16 GEMM, which is the only numerical difference to the original (frame PSNR 41-48 dB to the original run, equal
+  to the original's own run-to-run variation).
+- `--cfg_pipeline 1` (default): the two CFG branches are issued on two pairs of CUDA streams so that the first shard of one branch overlaps the
+  second shard of the other; bit-identical to the sequential order. `--cfg_batch 1` runs both branches as one batch-2 forward instead.
+
+Per DiT forward 474 ms -> 352 ms, per video 37.0 s -> 26.1 s of DiT time and 45.8 s -> 36.9 s end to end (H100 80GB, 49 x 480 x 832, 50 steps,
+CFG on the first 60% of the steps). Reserved GPU memory grows to about 78 GiB per GPU because of the per-stream allocator pools; `--cfg_batch 1
+--cfg_pipeline 0` keeps it at 60-62 GiB at 26.7 s per video.
 
 ## Training
 

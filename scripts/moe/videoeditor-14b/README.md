@@ -131,7 +131,8 @@ therefore also carries the balance gradient to the routers. The released model u
 |---|---|
 | `wan_transformer3d_kiwi_moe_v3_1.py` | The DiT: a self-contained copy of `videox_fun/models/wan_transformer3d_kiwi.py`. Additions are marked `MOE-V3.1`: `Fp32Gate`, `route_tokens`, `dispatch_by_expert`, `expert_balance_loss`, `AddAuxiliaryLoss`, `MoEFFN`, `MoEKVSelfAttention`, `attention_with_scale`, the block- and model-level `moe` arguments and `moe_attns()` / `moe_ffns()`. The environment variable `MOE_ATTN_BACKEND` (`fa2` default, `fa3`, `cudnn`, `auto`) selects the attention kernel |
 | `moe_v3_1_model.py` | Assembly: `EXPERT_NAMES`, `build_dit` (builds the MoE DiT and optionally loads the merged expert initialisation), `mark_trainable` (three learning-rate groups: base / experts / routers), `TextEncoder` (MLLM), `build_mllm`, `build_vae`, `load_trainable_weights` |
-| `moe_v3_1_infer.py` | Inference on one video or on a case list, with text CFG and optional per-token expert maps |
+| `moe_v3_1_infer.py` | Inference on one video or on a case list, with text CFG and optional per-token expert maps; `--low_mem 1` for 40 GB GPUs (see [Low-memory mode](#low-memory-mode-40-gb-gpus)) |
+| `moe_v3_1_infer_fast.py`, `moe_v3_1_model_fast.py`, `wan_transformer3d_kiwi_moe_v3_1_fast.py` | Fast-inference copies of the three files above (same weights; fused expert path, grouped GEMMs, second-GPU CFG replica, CUDA graphs; see [Fast inference](#fast-inference-two-gpus)) |
 | `moe_v3_1_train.py` | Training loop: DeepSpeed ZeRO-3, full DiT, flow-matching loss, checkpoint and resume |
 | `merge_experts_v3_1.py` | One-off: builds the initial weights of experts 1-6 (`experts_v3_1.safetensors`) from the LoRA experts and the direct fine-tune |
 | `train_multinode.sh` | Multi-node launcher (default 3 nodes × 8 GPUs). Writes the ZeRO-3 config and runs `accelerate launch` |
@@ -174,7 +175,8 @@ optimizer state.
 
 ## Inference
 
-Inference runs on one 80 GB GPU. Run the commands from the repository root:
+Inference runs on one 80 GB GPU (one 40 GB GPU with `--low_mem 1`, see [Low-memory mode](#low-memory-mode-40-gb-gpus)). Run the commands from
+the repository root:
 
 ```bash
 # one video, one instruction
@@ -211,7 +213,12 @@ defaults to the directory of the file.
 | `--dump_expert_maps` | 1 | write per-token expert maps (see below) |
 | `--frames_png` | 1 | also write lossless PNG frames |
 | `--skip_existing` | 1 | skip cases whose outputs are already complete |
-| `--min_free_gib` | 60 | refuse to start if the GPU has less free memory than this |
+| `--min_free_gib` | 60 (20 with `--low_mem 1`) | refuse to start if the GPU has less free memory than this |
+| `--low_mem` | 0 | `1` = low-memory mode: MLLM in pinned host memory except while encoding, MoE blocks that do not fit streamed from pinned host memory (see below) |
+| `--reserve_gib` | 12 | low-memory mode: GPU memory kept free for the MLLM encoder (while encoding), activations and VAE decoding when choosing how many MoE blocks stay resident |
+| `--resident_blocks` | -1 | low-memory mode: number of resident MoE blocks; `-1` = as many as fit into (free memory - `--reserve_gib`) |
+| `--numa_bind` | 1 | low-memory mode: bind the process to the CPUs of the GPU's NUMA node before pinning host memory |
+| `--emulate_gpu_gib` | 0 | testing: cap the PyTorch allocator at this many GiB (e.g. 38 to emulate a 40 GB GPU on a larger one) |
 | `--base_only` | 0 | `1` runs the unmodified Kiwi-Edit DiT (no MoE layers) through the same pipeline as a baseline. `--ckpt` must still point to a directory that contains `meta.json` |
 
 Outputs in `<OUT_DIR>` (or `<OUT_DIR>/<label>/` with `--variants`):
@@ -228,6 +235,51 @@ If `--out_dir` is omitted, the output goes to `<run>/render/<ckpt dir name>/`, w
 contains the checkpoint's `ckpt/` folder (for `$BASE_DIR/ckpt/videoeditor-14b` this is `$BASE_DIR/render/videoeditor-14b/`).
 The exit codes 17 (non-finite weights), 18 (the MLLM self-test failed three times) and 19 (non-finite or constant output; nothing is
 written) are meant for a runner that retries.
+
+### Low-memory mode (40 GB GPUs)
+
+The default run peaks at 39.1 GiB of GPU memory (26.1 GiB DiT, 7.1 GiB MLLM encoder, VAE and activations) and does not fit a 40 GB GPU.
+`--low_mem 1` keeps the MLLM encoder in pinned host memory and copies it to the GPU only while a case is encoded; the dense blocks, embeddings
+and head stay resident, and as many of the 14 MoE blocks (1.5 GiB each) as fit into (free GPU memory - `--reserve_gib`) stay resident, the rest
+being streamed from pinned host memory block by block through two GPU slots (the next block is prefetched on a side stream while the current one
+computes). The results are those of the default mode up to the pipeline's run-to-run variation (same kernels, same data).
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/moe/videoeditor-14b/moe_v3_1_infer.py --low_mem 1 --reserve_gib 10 \
+    --base_dir $BASE_DIR --ckpt $BASE_DIR/ckpt/videoeditor-14b --src_video <in.mp4> --prompt "Remove the dog" --name dog --out_dir <OUT_DIR>
+```
+
+| setting (one GPU) | resident / streamed MoE blocks | peak GPU memory | time per 49-frame video |
+|---|---|---|---|
+| default mode, 80 GB | 14 / 0 | 39.1 GiB | 35 s |
+| `--low_mem 1 --reserve_gib 10`, 40 GB | 14 / 0 | 35.2 GiB | 33-37 s (default-mode speed) |
+| `--low_mem 1`, 40 GB (default reserve 12 GiB) | 11 / 3 | 33.7 GiB | 49-56 s |
+
+The 40 GB rows were measured on an 80 GB GPU with `--emulate_gpu_gib 38` (allocator capped at 38 GiB). With `--reserve_gib 10` the whole DiT
+stays resident and the only cost is copying the MLLM in and out (about 2 s per case); each streamed block adds 1.5 GiB of host-to-GPU traffic per
+DiT forward (80 forwards per video; 14 GB/s from pinned memory on our server).
+
+### Fast inference (two GPUs)
+
+`moe_v3_1_infer_fast.py` has the same command line as `moe_v3_1_infer.py` plus `--fuse_experts`, `--fuse_kv`, `--moe_impl`, `--cfg_batch`,
+`--dp_cfg` and `--cuda_graph`; it builds the DiT from `moe_v3_1_model_fast.py` / `wan_transformer3d_kiwi_moe_v3_1_fast.py`. Recommended:
+
+```bash
+MOE_ATTN_BACKEND=fa2 CUDA_VISIBLE_DEVICES=0,1 python scripts/moe/videoeditor-14b/moe_v3_1_infer_fast.py \
+    --moe_impl grouped --dp_cfg 1 --cuda_graph 1 \
+    --base_dir $BASE_DIR --ckpt $BASE_DIR/ckpt/videoeditor-14b --src_video <in.mp4> --prompt "Remove the dog" --name dog --out_dir <OUT_DIR>
+```
+
+- `--fuse_experts 1` / `--fuse_kv 1` (defaults): stacked expert weights (views, no extra memory) and one GEMM per expert for k and v; bit-identical.
+- `--moe_impl grouped`: one `torch._grouped_mm` per expert linear over the tokens sorted by expert (PyTorch >= 2.8), no host synchronisation; the
+  bias is added after the bf16 GEMM (the only numerical difference to the original; frame PSNR 41-48 dB, equal to the original's run-to-run variation).
+- `--dp_cfg 1`: a replica of the DiT on the second GPU runs the unconditional CFG branch concurrently with the conditional branch (bit-identical).
+- `--cuda_graph 1`: the DiT forward is captured in a CUDA graph per case and CFG branch and replayed (bit-identical; needs `--moe_impl grouped`
+  and `MOE_ATTN_BACKEND=fa2`, whose equal-length attention path is capture-safe). Capturing adds about 3 s per case.
+
+The single-GPU 14B forward is compute-bound (327 ms of kernel time per 333 ms forward), so on one GPU these options gain at most ~5%; with the
+replica and CUDA graphs a CFG step takes 330 ms instead of 654 ms: 26.1 s -> 16.5 s of DiT time per video, 35.3 s -> 30.2 s end to end
+(H100 80GB, 49 x 480 x 832, 50 steps, CFG on the first 60% of the steps).
 
 ## Training
 
