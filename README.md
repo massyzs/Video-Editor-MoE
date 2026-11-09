@@ -1,8 +1,8 @@
 # Video-Editor-MoE
 
 <p align="center">
-  <img src="assets/tencent_video.png" alt="Tencent Video" height="56">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="assets/nus.png" alt="National University of Singapore" height="72">
+  <img src="assets/tencent_video.png" alt="Tencent Video" height="64" align="middle">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="assets/nus.png" alt="National University of Singapore" height="64" align="middle">
 </p>
 
 <p align="center">
