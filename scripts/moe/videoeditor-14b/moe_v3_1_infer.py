@@ -14,8 +14,14 @@ Usage (<BASE_DIR> must contain ckpt/kiwi-edit-instruct-only-videoxfun/; <CKPT_DI
   Bench (sharded):        CUDA_VISIBLE_DEVICES=0 python moe_v3_1_infer.py --base_dir <BASE_DIR> --ckpt <CKPT_DIR> --bench_dir <BENCH_DIR with cases.json> --shard_idx 0 --num_shards 15
   Custom case list:       ... --cases_json my_cases.json [--bench_dir <video root dir; omitted = the directory of cases_json>]
   Output dir:             if --out_dir is omitted: <run>/render/<ckpt dir name>/ (convention: each run dir keeps weights in ckpt/, inference results in render/)
+  Low memory (40 GB GPU): ... --low_mem 1   The MLLM encoder stays in pinned host memory except while a case is encoded, and MoE blocks that do not fit into
+                          (free memory - --reserve_gib) are streamed from pinned host memory block by block (two GPU slots, next block prefetched while the
+                          current one computes). Same computation; the outputs agree with the default mode up to the pipeline's run-to-run GPU
+                          nondeterminism. On a 40 GB GPU pass --reserve_gib 10 so that all 14 MoE blocks stay resident (peak 35.3 GiB, default-mode speed).
+                          --emulate_gpu_gib 38 caps the allocator to test this on a larger GPU.
 """
 import argparse
+import functools
 import json
 import math
 import os
@@ -77,7 +83,13 @@ def parse_args():
     p.add_argument("--cfg_text_scale", type=float, default=3.0, help="Text CFG scale s: pred = u + s*(c-u); 1 = off")
     p.add_argument("--cfg_text_steps_frac", type=float, default=0.6, help="Segmented CFG: apply text CFG only in the first frac of denoising steps (sets structure), then turn it off (restores detail, less drift from the source video); 1.0 = all steps")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--min_free_gib", type=float, default=60.0, help="refuse to start if the GPU has less free memory than this (GiB)")
+    p.add_argument("--min_free_gib", type=float, default=None, help="refuse to start if the GPU has less free memory than this (GiB); default 60 (default mode) or 20 (--low_mem 1); negative = no check")
+    # Low-memory mode: MLLM in pinned host memory except while encoding; MoE blocks that do not fit are streamed from pinned host memory
+    p.add_argument("--low_mem", type=int, default=0, help="1 = low-memory mode (see docstring); 0 = unchanged default behaviour")
+    p.add_argument("--reserve_gib", type=float, default=12.0, help="--low_mem 1: GPU memory kept free for the MLLM encoder (while encoding), activations and VAE decoding when choosing how many MoE blocks stay resident")
+    p.add_argument("--resident_blocks", type=int, default=-1, help="--low_mem 1: number of MoE blocks kept resident on the GPU; -1 = as many as fit into (free memory - --reserve_gib)")
+    p.add_argument("--emulate_gpu_gib", type=float, default=0.0, help="testing only: cap the CUDA caching allocator at this many GiB (e.g. 38 to emulate a 40 GB GPU on a larger one); 0 = off")
+    p.add_argument("--numa_bind", type=int, default=1, help="--low_mem 1: bind the process to the CPUs of the GPU's NUMA node before pinning host memory (host->GPU copies from the other socket run at about half the bandwidth); 0 = off")
     p.add_argument("--fps", type=int, default=16)
     p.add_argument("--dump_expert_maps", type=int, default=1)
     p.add_argument("--base_only", type=int, default=0, help="1 = the un-finetuned kiwi-edit base (no MoE layers, no trained weights, rest of the pipeline unchanged); --ckpt only needs a placeholder meta.json")
@@ -237,6 +249,221 @@ def build_base_dit(ns, dtype):
     return dit.to(dtype=dtype)
 
 
+# ------------------------------------------------------------------ low-memory mode (--low_mem 1): host-resident MLLM + streamed MoE blocks
+def pin_packed(tensors):
+    """Copy CPU tensors into ONE pinned host buffer; returns (buffer, views, byte offsets), the views in the order of `tensors`. The caching host
+    allocator rounds every pinned allocation up to the next power of two, so pinning the ~300 tensors of a block or the ~800 of the MLLM one by one
+    needs about 1.6x their size; one allocation per group wastes at most 13% (a 7.08 GiB block takes 8 GiB)."""
+    sizes = [t.numel() * t.element_size() for t in tensors]
+    offsets, total = [], 0
+    for n in sizes:
+        total = (total + 255) // 256 * 256               # 256-byte alignment of every tensor inside the buffer
+        offsets.append(total)
+        total += n
+    buf = torch.empty(max(total, 1), dtype=torch.uint8, pin_memory=True)
+    views = views_into(buf, offsets, tensors)
+    for v, t in zip(views, tensors):
+        v.copy_(t)
+    return buf, views, offsets
+
+
+def views_into(buf, offsets, like):
+    """Views into the byte buffer `buf` at `offsets` with the dtypes and shapes of the tensors in `like`."""
+    return [buf[o:o + t.numel() * t.element_size()].view(t.dtype).view(t.shape) for o, t in zip(offsets, like)]
+
+
+def pinned_size(nbytes):
+    """Host memory a pinned allocation of nbytes really takes (the caching host allocator rounds up to the next power of two)."""
+    return 1 << max(0, (nbytes - 1).bit_length())
+
+
+def check_host_ram(extra_bytes, what, tag):
+    """Exit with a clear message when MemAvailable (Linux) is below the extra host memory about to be page-locked (+10% margin), instead of a
+    cudaHostAlloc 'out of memory' or the OOM killer a few minutes later. Does nothing when /proc/meminfo is not readable."""
+    try:
+        avail = next(int(l.split()[1]) * 1024 for l in open("/proc/meminfo") if l.startswith("MemAvailable:"))
+    except (OSError, StopIteration, ValueError):
+        return
+    if avail < extra_bytes * 1.1:
+        raise SystemExit(f"{tag} low_mem: {what} needs about {extra_bytes / 2**30:.0f} GiB more host RAM (page-locked) but only {avail / 2**30:.0f} GiB is available")
+
+
+class HostResident:
+    """Keeps a frozen module's parameters and buffers in one pinned host buffer and copies them to the GPU only while the module is needed:
+    load() before use, unload() after. unload() frees the GPU copy and points the module back at the pinned host tensors (frozen weights: no copy back)."""
+
+    def __init__(self, module, device):
+        self.module, self.device, self.loaded = module, torch.device(device), False
+        self.params = list(module.parameters())
+        self.bufs = [(m, n) for m in module.modules() for n, b in m._buffers.items() if b is not None]
+        tensors = [p.data for p in self.params] + [m._buffers[n] for m, n in self.bufs]
+        check_host_ram(pinned_size(sum(t.numel() * t.element_size() for t in tensors)), "pinning the MLLM encoder", "[infer-v3.1]")
+        self.host, views, self.offsets = pin_packed(tensors)
+        self._point(views)
+        self.gpu = None
+        self.gib = self.host.numel() / 2**30
+
+    def _tensors(self):
+        return [p.data for p in self.params] + [m._buffers[n] for m, n in self.bufs]
+
+    def _point(self, views):
+        for p, v in zip(self.params, views[:len(self.params)]):
+            p.data = v
+        for (m, n), v in zip(self.bufs, views[len(self.params):]):
+            m._buffers[n] = v
+
+    def load(self):
+        if not self.loaded:
+            self.gpu = self.host.to(self.device, non_blocking=True)
+            self._point(views_into(self.gpu, self.offsets, self._tensors()))
+            self.loaded = True
+        return self.module
+
+    def unload(self):
+        if self.loaded:
+            self._point(views_into(self.host, self.offsets, self._tensors()))
+            self.gpu = None
+            self.loaded = False
+            torch.cuda.empty_cache()
+
+
+class BlockStreamer:
+    """The parameters of the given (structurally identical) transformer blocks live in pinned host memory, one buffer per block. Before a block
+    runs, a pre-hook points its parameters at one of two GPU slots that a side stream has filled with the block's buffer (one copy per block);
+    the next block is prefetched into the other slot while the current block computes; after the block, a forward hook records when its slot is
+    free again and points the parameters back at the host copies. The blocks must run in the given order, once per forward pass (true for the
+    DiT block loop); any other order is detected and resynchronised (slower, same result)."""
+
+    def __init__(self, blocks, device, n_slots=2):
+        self.blocks, self.device = list(blocks), torch.device(device)
+        layout = [(n, tuple(p.shape), p.dtype) for n, p in self.blocks[0].named_parameters()]
+        for b in self.blocks[1:]:
+            assert [(n, tuple(p.shape), p.dtype) for n, p in b.named_parameters()] == layout, "streamed blocks must share one parameter layout"
+        block_bytes = sum(p.numel() * p.element_size() for _, p in self.blocks[0].named_parameters())
+        check_host_ram(len(self.blocks) * (pinned_size(block_bytes) - block_bytes) + pinned_size(block_bytes),
+                       f"pinning {len(self.blocks)} streamed blocks ({len(self.blocks) * pinned_size(block_bytes) / 2**30:.0f} GiB page-locked in total)", "[infer-v3.1]")
+        self.host = []                                   # per block: (pinned byte buffer, parameter views into it)
+        for b in self.blocks:
+            params = [p for _, p in b.named_parameters()]
+            buf, views, self.offsets = pin_packed([p.data for p in params])
+            for p, v in zip(params, views):
+                p.data = v
+            for m in b.modules():                        # buffers (if any) are small: resident on the GPU
+                for n, bt in m._buffers.items():
+                    if bt is not None:
+                        m._buffers[n] = bt.to(self.device)
+            self.host.append((buf, views))
+        nbytes = self.host[0][0].numel()
+        self.slots = [torch.empty(nbytes, dtype=torch.uint8, device=self.device) for _ in range(n_slots)]
+        self.slot_views = [views_into(s, self.offsets, self.host[0][1]) for s in self.slots]
+        self.slot_gib = nbytes / 2**30
+        self.host_gib = sum(pinned_size(buf.numel()) for buf, _ in self.host) / 2**30   # what the pinned allocations really take (power-of-two rounding)
+        self.copy_stream = torch.cuda.Stream(device=self.device)
+        self.freed = [None] * n_slots                    # per slot: event recorded when the compute that used it has finished
+        self.pending = None                              # (block index, slot, event): the prefetch in flight
+        self.next_slot = 0
+        self.in_use = 0
+        self.handles = []
+        for k, b in enumerate(self.blocks):
+            self.handles.append(b.register_forward_pre_hook(functools.partial(self._before, k)))
+            self.handles.append(b.register_forward_hook(functools.partial(self._after, k)))
+        self._prefetch(0)
+
+    def _prefetch(self, k):
+        s, self.next_slot = self.next_slot, (self.next_slot + 1) % len(self.slots)
+        with torch.cuda.stream(self.copy_stream):
+            if self.freed[s] is not None:
+                self.copy_stream.wait_event(self.freed[s])
+            self.slots[s].copy_(self.host[k][0], non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(self.copy_stream)
+        self.pending = (k, s, ev)
+
+    def _before(self, k, mod, args):
+        if self.pending is None or self.pending[0] != k:   # not the expected block (e.g. after an exception): resynchronise and fetch it now
+            torch.cuda.synchronize(self.device)
+            self.freed = [None] * len(self.slots)
+            self._prefetch(k)
+        _, s, ev = self.pending
+        self.pending = None
+        torch.cuda.current_stream(self.device).wait_event(ev)
+        for (_, p), v in zip(mod.named_parameters(), self.slot_views[s]):
+            p.data = v
+        self.in_use = s
+        self._prefetch((k + 1) % len(self.blocks))        # the next streamed block; after the last one, the first block of the next forward pass
+
+    def _after(self, k, mod, args, out):
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(self.device))
+        self.freed[self.in_use] = ev
+        for (_, p), v in zip(mod.named_parameters(), self.host[k][1]):
+            p.data = v
+
+
+def bind_to_gpu_numa_node(device_index=0):
+    """--low_mem 1: pin this process to the CPUs of the NUMA node the GPU is attached to, so that the pinned host memory allocated afterwards
+    (streamed MoE blocks, MLLM) is local to the GPU's PCIe root; host->GPU copies from the other socket of a two-socket server run at about
+    half the bandwidth. Linux only; returns the node index, or None when the topology is not available (then nothing is changed)."""
+    try:
+        p = torch.cuda.get_device_properties(device_index)
+        node = int(open(f"/sys/bus/pci/devices/{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0/numa_node").read())
+        if node < 0:
+            return None
+        cpus = set()
+        for part in open(f"/sys/devices/system/node/node{node}/cpulist").read().strip().split(","):
+            lo, _, hi = part.partition("-")
+            cpus.update(range(int(lo), int(hi or lo) + 1))
+        cpus &= os.sched_getaffinity(0)
+        if not cpus:
+            return None
+        os.sched_setaffinity(0, cpus)
+        return node
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def free_gpu_bytes(dev, cap_bytes):
+    """Free memory of a GPU; with --emulate_gpu_gib the allocator cap counts instead of the physical free memory."""
+    free, _ = torch.cuda.mem_get_info(dev)
+    if cap_bytes:
+        free = min(free, cap_bytes - torch.cuda.memory_reserved(dev))
+    return free
+
+
+def place_dit_low_mem(dit, device, reserve_gib, resident_blocks, cap_bytes):
+    """--low_mem 1: dense blocks, embeddings and head on the GPU; MoE blocks resident as long as they fit into (free memory - reserve_gib),
+    the rest streamed from pinned host memory by a BlockStreamer. Returns (dit, streamer or None, n_resident, n_streamed)."""
+    moe = list(dit.moe_layers)
+    if not moe:                                                       # no MoE layers (e.g. --base_only): the whole model fits, nothing to stream
+        return dit.to(device), None, 0, 0
+    for name, mod in dit.named_children():
+        if name != "blocks":
+            mod.to(device)
+    for i, b in enumerate(dit.blocks):
+        if i not in moe:
+            b.to(device)
+    for bn, buf in list(dit.named_buffers(recurse=False)):
+        setattr(dit, bn, buf.to(device))
+    block_bytes = sum(p.numel() * p.element_size() for p in dit.blocks[moe[0]].parameters())
+    avail = free_gpu_bytes(0, cap_bytes) - int(reserve_gib * 2**30)
+    if resident_blocks < 0:
+        n_res = len(moe) if avail >= len(moe) * block_bytes else int(max(0, (avail - 2 * block_bytes) // block_bytes))
+    else:
+        n_res = max(0, min(len(moe), resident_blocks))
+    need = (n_res + (2 if n_res < len(moe) else 0)) * block_bytes + int(reserve_gib * 2**30)
+    if avail + int(reserve_gib * 2**30) < need:                      # fail now with the numbers instead of later with a raw CUDA out-of-memory error
+        raise SystemExit(f"[infer-v3.1] low_mem: {(avail + int(reserve_gib * 2**30)) / 2**30:.1f} GiB free on cuda:0 after placing the dense blocks, but "
+                         f"{n_res} resident MoE blocks{' + 2 streaming slots' if n_res < len(moe) else ''} of {block_bytes / 2**30:.2f} GiB plus the "
+                         f"{reserve_gib} GiB reserve need {need / 2**30:.1f} GiB; use a GPU with more memory or a lower --reserve_gib / --resident_blocks")
+    for i in moe[:n_res]:
+        dit.blocks[i].to(device)
+    streamer = BlockStreamer([dit.blocks[i] for i in moe[n_res:]], device) if n_res < len(moe) else None
+    print(f"[infer-v3.1] low_mem: MoE block {block_bytes / 2**30:.2f} GiB, {n_res} resident + {len(moe) - n_res} streamed"
+          f"{f' through 2 slots of {streamer.slot_gib:.2f} GiB from {streamer.host_gib:.0f} GiB of pinned host memory ({len(moe) - n_res} buffers)' if streamer else ''}; reserve {reserve_gib} GiB; "
+          f"cuda:0 allocated {torch.cuda.memory_allocated(0) / 2**30:.1f} GiB, free {free_gpu_bytes(0, cap_bytes) / 2**30:.1f} GiB", flush=True)
+    return dit, streamer, n_res, len(moe) - n_res
+
+
 @torch.no_grad()
 def prepare_case(dit, text_encoder, vae, case, a, device, dtype, need_null):
     """Do the variant-independent part of a case once: read the source video (first N frames + short-side fit + center crop), MLLM encoding
@@ -244,8 +471,13 @@ def prepare_case(dit, text_encoder, vae, case, a, device, dtype, need_null):
     from videox_fun.data.kiwi_video_utils import frames_to_video_tensor
     src_frames = load_video_frames_first_n(os.path.join(a.bench_dir, case["src"]), a.num_frames, a.width, a.height)
     prompt = COMPOUND_JOINER.join(case["prompts"])
+    host = getattr(text_encoder, "host", None)                      # --low_mem 1: the MLLM is on the GPU only while encoding
+    if host is not None:
+        host.load()
     ctx_cond = [text_encoder.encode(prompt, src_frames)]
     ctx_null = [text_encoder.encode_null(src_frames)] if need_null else None
+    if host is not None:
+        host.unload()
 
     src_latents = vae.encode(frames_to_video_tensor(src_frames, dtype=torch.float32).to(device, dtype))[0].sample()
     latent_channels = getattr(vae.config, "z_dim", None) or vae.config.latent_channels
@@ -320,8 +552,15 @@ def main():
     # Create the GPU context and check free memory first, so we exit before the slow model build instead of OOM-ing at .to(cuda).
     torch.cuda.set_device(0)
     _hold = torch.zeros(1, device=device)
+    cap_bytes = 0
+    if a.emulate_gpu_gib > 0:                                         # testing: pretend the GPU has only this much memory
+        cap_bytes = int(a.emulate_gpu_gib * 2**30)
+        torch.cuda.set_per_process_memory_fraction(min(1.0, cap_bytes / torch.cuda.get_device_properties(0).total_memory), 0)
+    if a.min_free_gib is None:
+        a.min_free_gib = 20.0 if a.low_mem else 60.0
     _free, _total = torch.cuda.mem_get_info()
-    print(f"[infer] GPU context created, free memory {_free / 2**30:.1f} / {_total / 2**30:.1f} GiB", flush=True)
+    _free = min(_free, cap_bytes) if cap_bytes else _free
+    print(f"[infer] GPU context created, free memory {_free / 2**30:.1f} / {_total / 2**30:.1f} GiB" + (f" (allocator capped at {a.emulate_gpu_gib} GiB)" if cap_bytes else ""), flush=True)
     if _free < a.min_free_gib * 2**30:
         raise SystemExit(f"[infer] only {_free / 2**30:.1f} GiB of GPU memory free (<{a.min_free_gib}); another process may be holding GPU memory")
     if not a.out_dir:
@@ -337,20 +576,38 @@ def main():
         a.dump_expert_maps = 0
     else:
         dit = build_dit_fast(ns, dtype, os.path.join(a.ckpt, "moe_v3_1_trainable.safetensors"), a.fast_init)
-    dit = dit.to(device).eval()
+    dit = dit.eval()
+    dit.requires_grad_(False)
+    streamer, n_res, n_str, numa_node = None, len(dit.moe_layers), 0, None
+    if a.low_mem:
+        numa_node = bind_to_gpu_numa_node(0) if a.numa_bind else None
+        print(f"[infer-v3.1] low_mem: process bound to the {len(os.sched_getaffinity(0))} CPUs of NUMA node {numa_node} (the GPU's node)" if numa_node is not None
+              else f"[infer-v3.1] low_mem: NUMA binding {'off' if not a.numa_bind else 'not available on this system'}", flush=True)
+        dit, streamer, n_res, n_str = place_dit_low_mem(dit, device, a.reserve_gib, a.resident_blocks, cap_bytes)
+    else:
+        dit = dit.to(device)
     # MLLM self-test + rebuild (as in training): run a fixed instruction + blank frames and check the output is finite; a one-off bad state like this once made 4 of 75 bench clips all black (NaN → 0)
     from PIL import Image as _Image
     _probe = [_Image.new("RGB", (a.width, a.height))] * a.num_frames
     for _attempt in range(1, 4):
-        text_encoder = TextEncoder(build_mllm(ns).to(device))
-        _where = text_encoder.self_test("Add a red ball.", _probe)
+        if a.low_mem:                                                 # MLLM in pinned host memory, on the GPU only while encoding
+            text_encoder = TextEncoder(build_mllm(ns))
+            text_encoder.host = HostResident(text_encoder.mllm, device)
+            text_encoder.host.load()
+            _where = text_encoder.self_test("Add a red ball.", _probe)
+            text_encoder.host.unload()
+        else:
+            text_encoder = TextEncoder(build_mllm(ns).to(device))
+            _where = text_encoder.self_test("Add a red ball.", _probe)
         if _where is None:
-            print(f"[infer] MLLM self-test passed (attempt {_attempt})", flush=True); break
+            print(f"[infer] MLLM self-test passed (attempt {_attempt}{', host-resident' if a.low_mem else ''})", flush=True); break
         print(f"[infer] MLLM self-test failed, first non-finite at [{_where}], attempt {_attempt}; rebuilding it entirely", flush=True)
         del text_encoder; import gc; gc.collect(); torch.cuda.empty_cache()
     else:
         print("[infer] MLLM self-test failed 3 times in a row, exit 18 so the caller can retry", flush=True); sys.exit(18)
     vae = build_vae(ns, dtype).to(device).eval()
+    print(f"[infer] all models ready: GPU free {free_gpu_bytes(0, cap_bytes) / 2**30:.1f} GiB, allocated {torch.cuda.memory_allocated(0) / 2**30:.1f} GiB"
+          + (f"; low_mem: {n_res} MoE blocks resident, {n_str} streamed" if a.low_mem else ""), flush=True)
     bad = [n for n, p in dit.named_parameters() if not torch.isfinite(p).all()]
     if bad:
         print(f"[infer-v3.1] ⚠ {len(bad)} non-finite weights, e.g. {bad[:3]}, exit 17 so the caller can retry", flush=True)
@@ -392,7 +649,9 @@ def main():
             save_videos_grid(video, out_mp4, fps=a.fps)
             frames_dir = save_frames_png(video, os.path.join(vdir, "frames", case["name"])) if a.frames_png else None
             rec = {"name": case["name"], "src": case["src"], "prompts": case["prompts"], "out": out_mp4, "ckpt": a.ckpt,
-                   "steps": a.steps, "cfg": f"text_x{v['cfg_text_scale']}_first{v['cfg_text_steps_frac']}", "sigma_shift": v["sigma_shift"], "variant_label": v["label"], "prep_s": prep_s, "seed": a.seed, "variant": ("kiwi_base" if a.base_only else "moe_v3_1"), "elapsed_s": round(time.time() - t0, 1), "frames_dir": frames_dir}
+                   "steps": a.steps, "cfg": f"text_x{v['cfg_text_scale']}_first{v['cfg_text_steps_frac']}", "sigma_shift": v["sigma_shift"], "variant_label": v["label"], "prep_s": prep_s, "seed": a.seed, "variant": ("kiwi_base" if a.base_only else "moe_v3_1"), "elapsed_s": round(time.time() - t0, 1), "frames_dir": frames_dir,
+                   "low_mem": a.low_mem, "resident_moe_blocks": n_res, "streamed_moe_blocks": n_str, "emulate_gpu_gib": a.emulate_gpu_gib, "numa_node": numa_node,
+                   "peak_mem_gib": {"cuda:0": [round(torch.cuda.max_memory_allocated(0) / 2**30, 2), round(torch.cuda.max_memory_reserved(0) / 2**30, 2)]}}
             if expert_maps:
                 for kind in ("attn", "ffn"):
                     maps_k = {layer: m for (k_, layer), m in expert_maps.items() if k_ == kind}
@@ -403,7 +662,7 @@ def main():
             with open(os.path.join(vdir, f"manifest_shard{a.shard_idx}.jsonl"), "a") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             n_done += 1
-            print(f"[infer-v3.1] shard {a.shard_idx} done {ci + 1}/{len(my_cases)}: {case['name']}[{v['label'] or '-'}] {rec['elapsed_s']}s (prep {prep_s}s)", flush=True)
+            print(f"[infer-v3.1] shard {a.shard_idx} done {ci + 1}/{len(my_cases)}: {case['name']}[{v['label'] or '-'}] {rec['elapsed_s']}s (prep {prep_s}s, peak GPU memory allocated/reserved GiB {rec['peak_mem_gib']})", flush=True)
         del prep
     print(f"[infer-v3.1] shard {a.shard_idx} ALL DONE ({n_done} outputs)", flush=True)
 
