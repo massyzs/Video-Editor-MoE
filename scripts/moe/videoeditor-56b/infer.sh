@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# videoeditor-56b, default inference: two 80 GB GPUs (the DiT is split by block across both), about 46 s per 49-frame video (H100).
+# videoeditor-56b, default inference: two 80 GB GPUs (the DiT is split by block across both), about 46 s end to end per 49-frame video (H100; MLLM/VLM encoding and VAE included).
 # Host RAM: about 120 GB while loading.
 # Edit the configuration block, then run from anywhere:  bash scripts/moe/videoeditor-56b/infer.sh
 # One video in, one video out: <OUT_DIR>/<NAME>.mp4 plus lossless PNG frames in <OUT_DIR>/frames/<NAME>/.

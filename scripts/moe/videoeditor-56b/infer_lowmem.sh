@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # videoeditor-56b, low-memory inference on ONE GPU: 80 GB (6 MoE blocks resident + 8 streamed, peak 71 GiB, about 6 min per
-# 49-frame video on H100) or 40 GB (all 14 MoE blocks streamed, peak 28 GiB, about 10 min per video). The MLLM encoder stays in pinned host memory
+# 49-frame video on H100) or 40 GB (all 14 MoE blocks streamed, peak 28 GiB, about 10 min per video; times are end to end, MLLM/VLM encoding and VAE included). The MLLM encoder stays in pinned host memory
 # except while a case is encoded; MoE blocks that do not fit are streamed from pinned host memory block by block. Same weights and the same
 # computation as the two-GPU script. Host RAM: 112 GB for the model plus 8 GiB per streamed block (75 GB resident set on 80 GB GPUs,
 # 125 GB on 40 GB GPUs); starting takes a few minutes longer (pinning).

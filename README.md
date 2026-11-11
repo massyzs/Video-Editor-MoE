@@ -100,7 +100,7 @@ bash scripts/moe/videoeditor-56b/infer_lowmem.sh     # low memory: one 80 GB or 
 bash scripts/moe/videoeditor-56b/infer_fast.sh       # fast: two 80 GB GPUs
 ```
 
-| script | what it runs | GPUs | time per 49-frame video (H100) | host RAM |
+| script | what it runs | GPUs | end-to-end time per 49-frame video (H100; MLLM/VLM encoding and VAE included) | host RAM |
 |---|---|---|---|---|
 | `videoeditor-14b/infer.sh` | `moe_v3_1_infer.py` | 1 x 80 GB | 35 s | 30 GB |
 | `videoeditor-14b/infer_lowmem.sh` | `moe_v3_1_infer.py --low_mem 1 --reserve_gib 10` | 1 x 40 GB (peak 35 GiB) | 35 s | 45 GB |
@@ -109,7 +109,8 @@ bash scripts/moe/videoeditor-56b/infer_fast.sh       # fast: two 80 GB GPUs
 | `videoeditor-56b/infer_lowmem.sh` | `moe_v3_2_infer.py --gpus 1 --low_mem 1` | 1 x 80 GB (peak 71 GiB) / 1 x 40 GB (peak 28 GiB) | 6 min / 10 min | 75 GB / 125 GB |
 | `videoeditor-56b/infer_fast.sh` | `moe_v3_2_infer_fast.py --gpus 2 --moe_impl grouped` | 2 x 80 GB | 37 s | 120 GB while loading |
 
-All six produce the same edit for the same weights, seed and settings (the fast scripts up to bf16 rounding, the low-memory mode up to the
+The times are end to end for one video with the model already loaded: MLLM (VLM) encoding of the instruction and source video, DiT sampling,
+VAE encoding and decoding, and writing the outputs. All six produce the same edit for the same weights, seed and settings (the fast scripts up to bf16 rounding, the low-memory mode up to the
 pipeline's run-to-run GPU variation). `EXTRA_ARGS` in the configuration block passes any further option of the python script (sampling steps,
 seed, CFG scale, ...); the sections below and the per-model READMEs describe them. Every model edits one source video from a text instruction. Inputs: `--src_video` is any mp4 (the first frames are used, resized/cropped to
 480x832; 49 frames by default, `--num_frames 121` or `81` for the `-long` models), `--prompt` is the instruction (or `--prompts "step 1 ||| step 2"`
@@ -145,7 +146,7 @@ See the README in each model directory for all options.
 command line plus speed options. They build the DiT from `*_model_fast.py` / `wan_transformer3d_kiwi_moe_v3_*_fast.py`, copies of the model
 files with an inference-only fused expert path; the original scripts and model files are unchanged, and the weights are the same.
 
-| model | command | GPUs | DiT time per video | end to end per video |
+| model | command | GPUs | DiT time per video | end to end per video (MLLM/VLM encoding and VAE included) |
 |---|---|---|---|---|
 | videoeditor-56b | `moe_v3_2_infer_fast.py --gpus 2 --moe_impl grouped` | 2 x 80 GB | 37.0 s -> 26.1 s | 45.8 s -> 36.9 s |
 | videoeditor-14b | `MOE_ATTN_BACKEND=fa2 moe_v3_1_infer_fast.py --moe_impl grouped --dp_cfg 1 --cuda_graph 1` | 2 x 80 GB | 26.1 s -> 16.5 s | 35.3 s -> 30.2 s |
@@ -179,12 +180,12 @@ same data). Speed is bound by the host-to-GPU copies: each streamed videoeditor-
 each videoeditor-14b block 1.5 GiB. Host RAM: the bf16 model plus one pinned 8 GiB buffer per streamed block and 8 GiB for the MLLM
 (videoeditor-56b resident set: 75 GB with 6 resident blocks, 125 GB with all 14 streamed, 105 GB peak while loading).
 
-| model | command | GPU | MoE blocks resident / streamed | peak GPU memory | time per video |
+| model | command | GPU | MoE blocks resident / streamed | peak GPU memory | end-to-end time per video (MLLM/VLM encoding and VAE included) |
 |---|---|---|---|---|---|
-| videoeditor-56b | `moe_v3_2_infer.py --gpus 1 --low_mem 1` | 1 x 80 GB | 6 / 8 | 70.8 GiB | 351-356 s (about 6 min; two-GPU default mode: 46 s) |
-| videoeditor-56b | `moe_v3_2_infer.py --gpus 1 --low_mem 1` | 1 x 40 GB | 0 / 14 | 28.3 GiB | 600-611 s (about 10 min) |
-| videoeditor-14b | `moe_v3_1_infer.py --low_mem 1 --reserve_gib 10` | 1 x 40 GB | 14 / 0 | 35.2 GiB | 33-37 s (same as the default mode on 80 GB) |
-| videoeditor-14b | `moe_v3_1_infer.py --low_mem 1` | 1 x 40 GB | 11 / 3 | 33.7 GiB | 49-56 s |
+| videoeditor-56b | `moe_v3_2_infer.py --gpus 1 --low_mem 1` | 1 x 80 GB | 6 / 8 | 70.8 GiB | 354-358 s (about 6 min; two-GPU default mode: 46 s) |
+| videoeditor-56b | `moe_v3_2_infer.py --gpus 1 --low_mem 1` | 1 x 40 GB | 0 / 14 | 28.3 GiB | 603-613 s (about 10 min) |
+| videoeditor-14b | `moe_v3_1_infer.py --low_mem 1 --reserve_gib 10` | 1 x 40 GB | 14 / 0 | 35.2 GiB | 35-39 s (same as the default mode on 80 GB) |
+| videoeditor-14b | `moe_v3_1_infer.py --low_mem 1` | 1 x 40 GB | 11 / 3 | 33.7 GiB | 52-60 s |
 
 Measured on H100 80GB with the host-to-GPU copy bandwidth of our server (14 GB/s from pinned memory); the 40 GB rows use
 `--emulate_gpu_gib 38`, which caps the PyTorch allocator at 38 GiB (without `--low_mem 1` the 14B run stops with an out-of-memory error at

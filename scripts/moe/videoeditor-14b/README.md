@@ -251,11 +251,11 @@ CUDA_VISIBLE_DEVICES=0 python scripts/moe/videoeditor-14b/moe_v3_1_infer.py --lo
     --base_dir $BASE_DIR --ckpt $BASE_DIR/ckpt/videoeditor-14b --src_video <in.mp4> --prompt "Remove the dog" --name dog --out_dir <OUT_DIR>
 ```
 
-| setting (one GPU) | resident / streamed MoE blocks | peak GPU memory | time per 49-frame video |
+| setting (one GPU) | resident / streamed MoE blocks | peak GPU memory | end-to-end time per 49-frame video (MLLM/VLM encoding and VAE included) |
 |---|---|---|---|
 | default mode, 80 GB | 14 / 0 | 39.1 GiB | 35 s |
-| `--low_mem 1 --reserve_gib 10`, 40 GB | 14 / 0 | 35.2 GiB | 33-37 s (default-mode speed) |
-| `--low_mem 1`, 40 GB (default reserve 12 GiB) | 11 / 3 | 33.7 GiB | 49-56 s |
+| `--low_mem 1 --reserve_gib 10`, 40 GB | 14 / 0 | 35.2 GiB | 35-39 s (default-mode speed) |
+| `--low_mem 1`, 40 GB (default reserve 12 GiB) | 11 / 3 | 33.7 GiB | 52-60 s |
 
 The 40 GB rows were measured on an 80 GB GPU with `--emulate_gpu_gib 38` (allocator capped at 38 GiB). With `--reserve_gib 10` the whole DiT
 stays resident and the only cost is copying the MLLM in and out (about 2 s per case); each streamed block adds 1.5 GiB of host-to-GPU traffic per
@@ -280,7 +280,7 @@ MOE_ATTN_BACKEND=fa2 CUDA_VISIBLE_DEVICES=0,1 python scripts/moe/videoeditor-14b
   and `MOE_ATTN_BACKEND=fa2`, whose equal-length attention path is capture-safe). Capturing adds about 3 s per case.
 
 The single-GPU 14B forward is compute-bound (327 ms of kernel time per 333 ms forward), so on one GPU these options gain at most ~5%; with the
-replica and CUDA graphs a CFG step takes 330 ms instead of 654 ms: 26.1 s -> 16.5 s of DiT time per video, 35.3 s -> 30.2 s end to end
+replica and CUDA graphs a CFG step takes 330 ms instead of 654 ms: 26.1 s -> 16.5 s of DiT time per video, 35.3 s -> 30.2 s end to end, MLLM/VLM encoding and VAE included
 (H100 80GB, 49 x 480 x 832, 50 steps, CFG on the first 60% of the steps).
 
 ## Training

@@ -183,10 +183,10 @@ GPU slots: before a block runs, its weights are copied into a slot, and the next
 computes. All 35 experts of a layer are used in every forward pass, so streaming per block is the right granularity. The results are those of
 the two-GPU run up to the pipeline's run-to-run variation (same kernels on the same data).
 
-| GPU | resident / streamed MoE blocks | peak GPU memory | time per 49-frame video |
+| GPU | resident / streamed MoE blocks | peak GPU memory | end-to-end time per 49-frame video (MLLM/VLM encoding and VAE included) |
 |---|---|---|---|
-| 1 x 80 GB | 6 / 8 (automatic) | 70.8 GiB | 351-356 s (about 6 min) |
-| 1 x 40 GB (`--emulate_gpu_gib 38` on an 80 GB GPU) | 0 / 14 | 28.3 GiB | 600-611 s (about 10 min) |
+| 1 x 80 GB | 6 / 8 (automatic) | 70.8 GiB | 354-358 s (about 6 min) |
+| 1 x 40 GB (`--emulate_gpu_gib 38` on an 80 GB GPU) | 0 / 14 | 28.3 GiB | 603-613 s (about 10 min) |
 | 2 x 80 GB, default mode | - | 58 + 60 GiB | 46 s |
 
 Each streamed block costs 7.1 GiB of host-to-GPU traffic per DiT forward (80 forwards per video), so the time is set by the PCIe bandwidth
@@ -216,7 +216,7 @@ CUDA_VISIBLE_DEVICES=0,1 python scripts/moe/videoeditor-56b/moe_v3_2_infer_fast.
 - `--cfg_pipeline 1` (default): the two CFG branches are issued on two pairs of CUDA streams so that the first shard of one branch overlaps the
   second shard of the other; bit-identical to the sequential order. `--cfg_batch 1` runs both branches as one batch-2 forward instead.
 
-Per DiT forward 474 ms -> 352 ms, per video 37.0 s -> 26.1 s of DiT time and 45.8 s -> 36.9 s end to end (H100 80GB, 49 x 480 x 832, 50 steps,
+Per DiT forward 474 ms -> 352 ms, per video 37.0 s -> 26.1 s of DiT time and 45.8 s -> 36.9 s end to end (MLLM/VLM encoding and VAE included; H100 80GB, 49 x 480 x 832, 50 steps,
 CFG on the first 60% of the steps). Reserved GPU memory grows to about 78 GiB per GPU because of the per-stream allocator pools; `--cfg_batch 1
 --cfg_pipeline 0` keeps it at 60-62 GiB at 26.7 s per video.
 

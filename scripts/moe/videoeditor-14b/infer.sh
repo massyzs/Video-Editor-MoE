@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# videoeditor-14b, default inference: one 80 GB GPU, about 35 s per 49-frame video (H100).
+# videoeditor-14b, default inference: one 80 GB GPU, about 35 s end to end per 49-frame video (H100; MLLM/VLM encoding and VAE included).
 # Edit the configuration block, then run from anywhere:  bash scripts/moe/videoeditor-14b/infer.sh
 # One video in, one video out: <OUT_DIR>/<NAME>.mp4 plus lossless PNG frames in <OUT_DIR>/frames/<NAME>/.
 BASE_DIR=/path/to/base_dir                    # contains ckpt/kiwi-edit-instruct-only-videoxfun/ (shared base components)

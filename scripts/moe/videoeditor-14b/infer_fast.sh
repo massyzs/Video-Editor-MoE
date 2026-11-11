@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # videoeditor-14b, fast inference: two 80 GB GPUs (unconditional CFG branch on a DiT replica on the second GPU, CUDA graphs,
-# grouped expert GEMMs), about 30 s per 49-frame video instead of 35 s (H100). Same weights; outputs equal to the default script up to bf16 rounding.
+# grouped expert GEMMs), about 30 s end to end per 49-frame video instead of 35 s (H100; MLLM/VLM encoding and VAE included). Same weights; outputs equal to the default script up to bf16 rounding.
 # With a single GPU set GPUS=0 DP_CFG=0 CUDA_GRAPH=0 (the single-GPU gain is only a few percent).
 # Edit the configuration block, then run from anywhere:  bash scripts/moe/videoeditor-14b/infer_fast.sh
 # One video in, one video out: <OUT_DIR>/<NAME>.mp4 plus lossless PNG frames in <OUT_DIR>/frames/<NAME>/.

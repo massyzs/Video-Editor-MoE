@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# videoeditor-56b, fast inference: two 80 GB GPUs, about 37 s per 49-frame video instead of 46 s (H100): fused expert weights,
+# videoeditor-56b, fast inference: two 80 GB GPUs, about 37 s end to end per 49-frame video instead of 46 s (H100; MLLM/VLM encoding and VAE included): fused expert weights,
 # grouped expert GEMMs, the two CFG branches pipelined on separate CUDA streams. Same weights; outputs equal to the default script up to bf16 rounding.
 # Reserved GPU memory grows to about 78 GiB per GPU; CFG_PIPELINE=0 CFG_BATCH=1 keeps it at 60-62 GiB at nearly the same speed.
 # Edit the configuration block, then run from anywhere:  bash scripts/moe/videoeditor-56b/infer_fast.sh
